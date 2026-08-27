@@ -1,42 +1,36 @@
-import yfinance
-import math
-from .strategy import Strategy
+"""Buy at Close, Sell at Open strategy."""
+
+from .strategy import Strategy, TradeResult
+
 
 class CloseOpen(Strategy):
-    # Need to refactor below function, neaten up, probably optimize, though the network will be the longest taking part of this I suspect. 
-    def calculate(self, showOutput):
-        if(showOutput):
-            print("Running backtest calculation...\n\n")
+    name = "BuyCloseSellOpen"
+    description = "Buy at each day's close, sell at next day's open."
 
-        iDay = 0
-        curClose = 0
-        curOpen = 0
-        for day in self.HISTORY.itertuples(index=False):
-            if(showOutput):
-                print(f"Day: {iDay}")
-                print(f"Cash: {self.CASH}")
-                print(f"Shares: {self.SHARES}")
-            curOpen = float(day.Open)
-            curClose = float(day.Close)
-            if(showOutput):
-                print(f"Open: {curOpen}")
-                print(f"Close: {curClose}")
-                print("--------------------------")
-                print("\n\n")
+    def calculate(self, verbose: bool = False) -> TradeResult:
+        if verbose:
+            print(f"Running {self.name} backtest...\n")
 
-            if(self.SHARES != 0):
-                self.CASH = self.CASH + self.SHARES * curOpen
-                self.SHARES = 0
+        for i, (date, row) in enumerate(self.history.iterrows()):
+            cur_open = float(row["Open"])
+            cur_close = float(row["Close"])
 
-            self.SHARES = math.floor(self.CASH/curClose)
-            self.CASH = self.CASH - self.SHARES * curClose
-            iDay = iDay + 1
+            if verbose:
+                print(f"  Day {i}: Open={cur_open:.2f} Close={cur_close:.2f}")
 
-        self.CASH = self.CASH + self.SHARES * curClose
-        if(showOutput):
-            print(self.CASH)
+            # Sell shares at open
+            if self.shares > 0:
+                self._sell(cur_open, date=date)
 
-        roi = float(((self.CASH / self.INITIAL_CASH) * 100) - 100)
+            # Buy shares at close
+            self._buy(cur_close, date=date)
 
-        return {"Ticker": self.TICKER, "Final Cash Value": self.CASH, "ROI": roi}
-        
+        # Liquidate remaining position at final close
+        if self.shares > 0:
+            final_close = float(self.history.iloc[-1]["Close"])
+            self._sell(final_close, date=self.history.index[-1])
+
+        if verbose:
+            print(f"\n  Final cash: {self.cash:.2f}\n")
+
+        return self._calculate_metrics()

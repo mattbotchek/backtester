@@ -1,32 +1,30 @@
-import yfinance
+"""Buy and Hold strategy — buy at first open, sell at last close."""
+
 import math
-from .strategy import Strategy
+
+from .strategy import Strategy, TradeResult
+
 
 class BuyAndHold(Strategy):
-    # Refactor this as well, not complex, but could be neater. 
-    def calculate(self, showOutput):
-        if(showOutput):
-            print("Running backtest calculation...\n\n")
+    name = "BuyAndHold"
+    description = "Buy at the first open price and hold until the last close price."
 
-        localData = self.HISTORY.iloc[[0, -1]]
+    def calculate(self, verbose: bool = False) -> TradeResult:
+        if verbose:
+            print(f"Running {self.name} backtest...\n")
 
-        initialBuy = float(localData.iloc[0]["Open"])
-    
-        self.SHARES = math.floor(self.CASH/initialBuy)
-        self.CASH = self.CASH - (self.SHARES * initialBuy)
+        first_open = float(self.history.iloc[0]["Open"])
+        last_close = float(self.history.iloc[-1]["Close"])
 
-        if(showOutput):
-            print(f"Initial Shares: {self.SHARES}")
-            print(f"Initial Cash: {self.CASH}\n\n")
+        self._buy(first_open, date=self.history.index[0])
 
-        sell = float(localData.iloc[1]["Close"])
-        self.CASH = self.CASH + (self.SHARES * sell)
-        self.SHARES = 0
+        if verbose:
+            print(f"  Bought {self.shares} shares @ {first_open:.2f}")
 
-        if(showOutput):
-            print(f"Final Shares: {self.SHARES}")
-            print(f"Final Cash: {self.CASH}\n\n")
+        self._sell(last_close, date=self.history.index[-1])
 
-        roi = float(((self.CASH / self.INITIAL_CASH) * 100) - 100)
+        if verbose:
+            print(f"  Sold all shares @ {last_close:.2f}")
+            print(f"  Final cash: {self.cash:.2f}\n")
 
-        return {"Ticker": self.TICKER, "Final Cash Value": self.CASH, "ROI": roi}
+        return self._calculate_metrics()
