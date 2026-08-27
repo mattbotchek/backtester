@@ -21,7 +21,8 @@ g_Modes = [
     "Individual Strategy",
     "Compare Strategy",
     "Check Multiple Tickers for Strategy",
-    "Check All Tickers for Strategy"
+    "Check All Tickers for Strategy",
+    "Compare Ticker for Multiple Strategies"
 ]
 
 # Strategies I think that would be cool to implement:
@@ -53,6 +54,21 @@ def userChooseStrategy():
 
     return userChoice
 
+def userInputChoices():
+    userChoice = userChooseStrategy()
+
+    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
+    userInterval = input("Enter interval: ")
+    userCash = input("Enter starting cash: ")
+    showOutput = input("Show output? (y/n): ")
+    print("\n\n\n\n\n\n\n")
+    
+    verbose = False
+    if(showOutput == 'y'):
+        verbose = True
+
+    return {"userChoice": userChoice, "userTimeline": userTimeline, "userInterval": userInterval, "userCash": userCash, "verbose": verbose}
+
 # Probably should refactor this so that it can take config file/data sheets
 def checkRunStrategy(userChoice, userTimeline, userInterval, userTicker, userCash, showOutput):
     match userChoice:
@@ -63,6 +79,9 @@ def checkRunStrategy(userChoice, userTimeline, userInterval, userTicker, userCas
             strat = closeopen.CloseOpen(userTimeline, userInterval, userTicker, userCash)
             return strat.calculate(showOutput)
 
+# Check if the ticker exists,
+# Boolean return
+# Tests via the data length return of a ticker history request
 def checkTickerExists(ticker):
     yfinanceLogger = logging.getLogger("yfinance")
     wasDisabled = yfinanceLogger.disabled
@@ -77,36 +96,29 @@ def checkTickerExists(ticker):
         yfinanceLogger.disabled = wasDisabled
 
 
-# Multi ticker run work area
+# Multi ticker/strategy run work area
 
 # Needs a big refactor, network seems to fail part way through, or maybe hitting rate limits
 # Need to investigate. 
 def checkAllTickers():
-    # Below "questions" chunk needs to be refactored into a function, but this is rough first draft
-    userChoice = userChooseStrategy()
-
-    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
-    userInterval = input("Enter interval: ")
-    userCash = input("Enter starting cash: ")
-    showOutput = input("Show output? (y/n): ")
-    print("\n\n\n\n\n\n\n")
-    
-    verbose = False
-    if(showOutput == 'y'):
-        verbose = True
+    choices = userInputChoices()
 
     # Can't tell if I suck, or if Python just gets messy
     # Probably needs a refactor
     tickerFile = open("allsymbols.txt", 'r')
-    outputFile = open(f"output-{userChoice}-{date.today()}-{userTimeline}-{userInterval}.csv", 'w')
+    outputFile = open(f"output-{choices["userChoice"]}-{date.today()}-{choices["userTimeline"]}-{choices["userInterval"]}.csv", 'w')
+
     fieldNames = ["Ticker", "Final Cash Value", "ROI"]
+
     writer = csv.DictWriter(outputFile, fieldnames=fieldNames)
     writer.writeheader()
 
     for line in tickerFile:
         localTicker = line.strip()
         if(checkTickerExists(localTicker)):
-            output = checkRunStrategy(userChoice, userTimeline, userInterval, localTicker, userCash, verbose)
+            output = checkRunStrategy(choices["userChoice"], choices["userTimeline"], 
+                                        choices["userInterval"], choices["localTicker"], 
+                                        choices["userCash"], choices["verbose"])
             writer.writerow(output)
 
     tickerFile.close()
@@ -117,31 +129,52 @@ def checkAllTickers():
 
 # Functionally this and checkAllTickers are the same, this just allows for a narrower scope
 def checkMultiTicker():
-    # Needs refactor into function
-    userChoice = userChooseStrategy()
-
-    userTicker = input("Enter stock tickers (comma-separated): ")
-    userTicker = userTicker.split(",")
-    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
-    userInterval = input("Enter interval: ")
-    userCash = input("Enter starting cash: ")
-    showOutput = input("Show output? (y/n): ")
-    print("\n\n\n\n\n\n\n")
-    verbose = False
-
-    if(showOutput == 'y'):
-        verbose = True
+    choices = userInputChoices()
 
     for ticker in userTicker:
         if(checkTickerExists(ticker)):
             # What is the rule? No more than 5 parameters per function? 
-            output = checkRunStrategy(userChoice, userTimeline, userInterval, ticker, userCash, verbose)
+            output = checkRunStrategy(choices["userChoice"], choices["userTimeline"], 
+                                        choices["userInterval"], choices["localTicker"], 
+                                        choices["userCash"], choices["verbose"])
+            print("------------------------")
+            print(f"Strategy: {g_Strategies[choices["userChoice"]]}")
             print(f"Ticker: {ticker} \nFinal Cash Value: {output['Final Cash Value']} \nROI%: {output['ROI']}\n")
 
     print("\n\n\n\n\n\n\n")
     main()
 
-    
+def compareTickerForMultipleStrategies():
+    strategiesToRun = []
+    collectInput = True
+
+    while collectInput:
+        strategiesToRun.append(userChooseStrategy())
+        continueInput = input("Select more strategies? (y/n):")
+
+        if(continueInput == 'n'):
+            collectInput = False
+
+    localTicker = input("Enter ticker: ")
+    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
+    userInterval = input("Enter interval: ")
+    userCash = input("Enter starting cash: ")
+    showOutput = input("Show output? (y/n): ")
+
+    verbose = False
+    if(showOutput == 'y'):
+        verbose = True
+    print("\n\n\n\n\n\n\n")
+
+    for index in strategiesToRun:
+        output = checkRunStrategy(index, userTimeline, 
+                                        userInterval, localTicker, 
+                                        userCash, verbose)
+        print("------------------------")
+        print(f"Strategy: {g_Strategies[index]}")
+        print(f"Ticker: {localTicker} \nFinal Cash Value: {output['Final Cash Value']} \nROI%: {output['ROI']}\n")
+
+
 
 # Compare strategy work area
 
@@ -154,18 +187,11 @@ def compareStrategies():
 
 
 def individualStrategy():
-    # Needs refactor here too
-    userChoice = userChooseStrategy()
+    userChoices = userInputChoices()
 
-    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
-    userInterval = input("Enter interval: ")
-    userTicker = input("Enter stock tickers (comma-separated): ")
-    userTicker = userTicker.split(",")
-    print(f"Tickers: {userTicker}\n")
-    userCash = input("Enter starting cash: ")
-    print("\n\n\n\n\n\n\n")
-
-    checkRunStrategy(userChoice, userTimeline, userInterval, userTicker, userCash)
+    checkRunStrategy(choices["userChoice"], choices["userTimeline"], 
+                                        choices["userInterval"], choices["localTicker"], 
+                                        choices["userCash"], choices["verbose"])
 
     print("\n\n\n\n\n\n\n")
     main()
@@ -197,6 +223,8 @@ def main():
             checkMultiTicker()
         case 3:
             checkAllTickers()
+        case 4:
+            compareTickerForMultipleStrategies()
 
 if __name__ == "__main__":
     main()
