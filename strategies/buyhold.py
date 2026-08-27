@@ -26,6 +26,6 @@ class BuyAndHold(Strategy):
             print(f"Final Shares: {self.SHARES}")
             print(f"Final Cash: {self.CASH}\n\n")
 
-        roi = float((self.CASH / self.INITIAL_CASH) * 100)
+        roi = float(((self.CASH / self.INITIAL_CASH) * 100) - 100)
 
         return {"Ticker": self.TICKER, "Final Cash Value": self.CASH, "ROI": roi}

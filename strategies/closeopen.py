@@ -35,6 +35,7 @@ class CloseOpen(Strategy):
         if(showOutput):
             print(self.CASH)
 
-        roi = float((self.CASH / self.INITIAL_CASH) * 100)
+        roi = float(((self.CASH / self.INITIAL_CASH) * 100) - 100)
+        
         return {"Ticker": self.TICKER, "Final Cash Value": self.CASH, "ROI": roi}
         

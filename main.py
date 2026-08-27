@@ -16,6 +16,7 @@ import logging
 g_Modes = [
     "Individual Strategy",
     "Compare Strategy",
+    "Check Multiple Tickers for Strategy",
     "Check All Tickers for Strategy"
 ]
 
@@ -67,7 +68,7 @@ def checkTickerExists(ticker):
         yfinanceLogger.disabled = wasDisabled
 
 
-# All ticker run work area
+# Multi ticker run work area
 
 
 def checkAllTickers():
@@ -77,13 +78,14 @@ def checkAllTickers():
     userInterval = input("Enter interval: ")
     userCash = input("Enter starting cash: ")
     showOutput = input("Show output? (y/n): ")
-
+    print("\n\n\n\n\n\n\n")
+    
     verbose = False
     if(showOutput == 'y'):
         verbose = True
 
     tickerFile = open("allsymbols.txt", 'r')
-    outputFile = open(f"output-{date.today()}-{userTimeline}-{userInterval}.csv", 'w')
+    outputFile = open(f"output-{userChoice}-{date.today()}-{userTimeline}-{userInterval}.csv", 'w')
     fieldNames = ["Ticker", "Final Cash Value", "ROI"]
     writer = csv.DictWriter(outputFile, fieldnames=fieldNames)
     writer.writeheader()
@@ -96,7 +98,33 @@ def checkAllTickers():
 
     tickerFile.close()
     outputFile.close()
+    
+    print("\n\n\n\n\n\n\n")
+    main()
 
+def checkMultiTicker():
+    userChoice = userChooseStrategy()
+
+    userTicker = input("Enter stock tickers (comma-separated): ")
+    userTicker = userTicker.split(",")
+    userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
+    userInterval = input("Enter interval: ")
+    userCash = input("Enter starting cash: ")
+    showOutput = input("Show output? (y/n): ")
+    print("\n\n\n\n\n\n\n")
+    verbose = False
+    if(showOutput == 'y'):
+        verbose = True
+
+    for ticker in userTicker:
+        if(checkTickerExists(ticker)):
+            output = checkRunStrategy(userChoice, userTimeline, userInterval, ticker, userCash, verbose)
+            print(f"Ticker: {ticker} \nFinal Cash Value: {output['Final Cash Value']} \nROI%: {output['ROI']}\n")
+
+    print("\n\n\n\n\n\n\n")
+    main()
+
+    
 
 # Compare strategy work area
 
@@ -113,10 +141,16 @@ def individualStrategy():
 
     userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
     userInterval = input("Enter interval: ")
-    userTicker = input("Enter stock ticker: ")
+    userTicker = input("Enter stock tickers (comma-separated): ")
+    userTicker = userTicker.split(",")
+    print(f"Tickers: {userTicker}\n")
     userCash = input("Enter starting cash: ")
+    print("\n\n\n\n\n\n\n")
 
     checkRunStrategy(userChoice, userTimeline, userInterval, userTicker, userCash)
+
+    print("\n\n\n\n\n\n\n")
+    main()
 
 
 # Main function
@@ -142,6 +176,8 @@ def main():
         case 1:
             compareStrategies()
         case 2:
+            checkMultiTicker()
+        case 3:
             checkAllTickers()
 
 if __name__ == "__main__":
