@@ -11,7 +11,12 @@ Includes:
 """
 
 import logging
+import warnings
 from functools import lru_cache
+
+# Suppress pandas fragmentation warnings — expected with incremental feature builds
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message="DataFrame is highly fragmented")
 
 import numpy as np
 import pandas as pd
