@@ -227,17 +227,15 @@ def _get_ml_prediction(ticker: str) -> dict:
 
         predictor = StockPredictor()
         predictor.load()
-        pred = predictor.predict_ticker(ticker)
+        pred = predictor.predict(ticker)
         return {
-            "direction": (
-                "UP" if pred.direction == 1
-                else ("DOWN" if pred.direction == -1 else "FLAT")
-            ),
-            "predicted_return": round(pred.predicted_return * 100, 2),
+            "direction": pred.direction,
+            "predicted_return": round(pred.predicted_return_pct, 2),
             "confidence": round(pred.confidence * 100, 1),
             "outliers": pred.outliers,
         }
-    except Exception:
+    except Exception as e:
+        logger.debug("Prediction failed for %s: %s", ticker, e)
         return {
             "direction": "N/A",
             "predicted_return": 0,

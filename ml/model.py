@@ -209,7 +209,7 @@ class StockPredictor:
 
         return self._training_stats
 
-    def predict(self, ticker: str, timeline: str = "1y",
+    def predict(self, ticker: str, timeline: str = "2y",
                 interval: str = "1d") -> Prediction:
         """Generate a prediction for a single ticker.
 
@@ -223,7 +223,7 @@ class StockPredictor:
         if data.empty:
             raise ValueError(f"No data available for {ticker}")
 
-        features = compute_features(data)
+        features = compute_features(data, ticker=ticker)
         if features.empty:
             raise ValueError(f"Insufficient data to compute features for {ticker}")
 
