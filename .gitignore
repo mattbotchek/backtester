@@ -4,3 +4,4 @@ results/
 ml/models/*.pkl
 ml/models/*.db
 _quick_check.py
+ml/__pycache__/

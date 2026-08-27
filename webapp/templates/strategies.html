@@ -10,6 +10,16 @@
         <h2>Run Strategies on a Ticker</h2>
         <div class="input-row">
             <input type="text" id="strat-ticker" placeholder="Enter ticker (e.g., AAPL)" value="AAPL">
+            <select id="strat-timeframe" class="select-input">
+                <option value="1mo">1 Month</option>
+                <option value="3mo">3 Months</option>
+                <option value="6mo">6 Months</option>
+                <option value="ytd" selected>Year to Date</option>
+                <option value="1y">1 Year</option>
+                <option value="2y">2 Years</option>
+                <option value="5y">5 Years</option>
+                <option value="max">Max</option>
+            </select>
             <button onclick="runStrategies()" class="btn btn-primary">Run All Strategies</button>
         </div>
         <div id="strat-results">
@@ -59,10 +69,12 @@
 <script>
 function runStrategies() {
     const ticker = document.getElementById('strat-ticker').value.toUpperCase();
+    const timeframe = document.getElementById('strat-timeframe').value;
     const container = document.getElementById('strat-results');
-    container.innerHTML = '<div class="loading">Running 22 strategies on ' + ticker + '...</div>';
+    const tfLabel = document.getElementById('strat-timeframe').selectedOptions[0].text;
+    container.innerHTML = '<div class="loading">Running 22 strategies on ' + ticker + ' (' + tfLabel + ')...</div>';
 
-    fetch(`/api/stock/${ticker}/strategies`)
+    fetch(`/api/stock/${ticker}/strategies?timeline=${timeframe}`)
         .then(r => r.json())
         .then(data => {
             const strats = data.strategies || [];

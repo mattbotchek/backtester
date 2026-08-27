@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}Market Wide — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="market-page">
+    <h1>Market-Wide Predictions</h1>
+    <p class="subtitle">Aggregate ML predictions across all tracked stocks, showing overall market direction and predicted highest movers.</p>
+
+    <!-- Market Direction -->
+    <section class="card">
+        <h2>Overall Market Direction</h2>
+        <div id="market-direction-panel">
+            <div class="loading">Analyzing market direction...</div>
+        </div>
+    </section>
+
+    <!-- Market Indices -->
+    <section class="card">
+        <h2>Major Indices</h2>
+        <div id="indices-grid" class="indices-grid">
+            <div class="loading">Loading indices...</div>
+        </div>
+    </section>
+
+    <!-- Predicted Highest Movers UP -->
+    <section class="card">
+        <h2>&#9650; Predicted Biggest Gainers</h2>
+        <div id="movers-up-panel">
+            <div class="loading">Loading predictions...</div>
+        </div>
+    </section>
+
+    <!-- Predicted Highest Movers DOWN -->
+    <section class="card">
+        <h2>&#9660; Predicted Biggest Decliners</h2>
+        <div id="movers-down-panel">
+            <div class="loading">Loading predictions...</div>
+        </div>
+    </section>
+
+    <!-- All Predictions Table -->
+    <section class="card">
+        <h2>All Stock Predictions</h2>
+        <div id="all-predictions-panel">
+            <div class="loading">Loading all predictions...</div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function renderMoversTable(containerId, movers) {
+    const container = document.getElementById(containerId);
+    if (!movers || !movers.length) {
+        container.innerHTML = '<div class="muted">No predictions available. Model may still be training.</div>';
+        return;
+    }
+    let html = `<table class="data-table">
+        <thead><tr><th>Ticker</th><th>Direction</th><th>Predicted Return</th><th>Confidence</th></tr></thead>
+        <tbody>`;
+    for (const p of movers) {
+        const isUp = p.direction === 'UP';
+        html += `<tr>
+            <td><a href="/stock/${p.ticker}">${p.ticker}</a></td>
+            <td class="${isUp ? 'up' : 'down'}">${p.direction}</td>
+            <td class="${isUp ? 'up' : 'down'}">${p.predicted_return.toFixed(2)}%</td>
+            <td>${p.confidence.toFixed(1)}%</td>
+        </tr>`;
+    }
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Load market indices
+    fetch('/api/market/overview')
+        .then(r => r.json())
+        .then(data => {
+            const grid = document.getElementById('indices-grid');
+            grid.innerHTML = '';
+            for (const [name, info] of Object.entries(data.indices || {})) {
+                const isUp = info.change >= 0;
+                grid.innerHTML += `
+                    <div class="index-card ${isUp ? 'up' : 'down'}">
+                        <div class="index-name">${name}</div>
+                        <div class="index-price">$${info.price.toLocaleString()}</div>
+                        <div class="index-change">${isUp ? '+' : ''}${info.change.toFixed(2)}%</div>
+                    </div>`;
+            }
+        })
+        .catch(() => {
+            document.getElementById('indices-grid').innerHTML = '<div class="error">Failed to load indices</div>';
+        });
+
+    // Load market-wide predictions
+    fetch('/api/market/predictions')
+        .then(r => r.json())
+        .then(data => {
+            // Market direction summary
+            const m = data.market || {};
+            const dirPanel = document.getElementById('market-direction-panel');
+            if (m.direction === 'N/A' || m.total === 0) {
+                dirPanel.innerHTML = '<div class="muted">No predictions available yet. Model is training in the background...</div>';
+            } else {
+                const isBull = m.direction === 'BULLISH';
+                dirPanel.innerHTML = `
+                    <div class="market-direction-card ${isBull ? 'up' : 'down'}">
+                        <div class="market-dir-icon">${isBull ? '&#9650;' : '&#9660;'}</div>
+                        <div class="market-dir-label">${m.direction}</div>
+                        <div class="market-dir-detail">
+                            ${m.confidence}% of predictions agree |
+                            ${m.up_count} UP vs ${m.down_count} DOWN (${m.total} stocks)
+                        </div>
+                    </div>`;
+            }
+
+            // Top movers
+            renderMoversTable('movers-up-panel', data.top_movers_up || []);
+            renderMoversTable('movers-down-panel', data.top_movers_down || []);
+
+            // All predictions
+            const allPanel = document.getElementById('all-predictions-panel');
+            const all = data.all_predictions || [];
+            if (!all.length) {
+                allPanel.innerHTML = '<div class="muted">No predictions available</div>';
+                return;
+            }
+            let html = `<table class="data-table">
+                <thead><tr><th>Ticker</th><th>Direction</th><th>Predicted Return</th><th>Confidence</th></tr></thead>
+                <tbody>`;
+            for (const p of all) {
+                const isUp = p.direction === 'UP';
+                html += `<tr>
+                    <td><a href="/stock/${p.ticker}">${p.ticker}</a></td>
+                    <td class="${isUp ? 'up' : 'down'}">${p.direction}</td>
+                    <td class="${isUp ? 'up' : 'down'}">${p.predicted_return.toFixed(2)}%</td>
+                    <td>${p.confidence.toFixed(1)}%</td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            allPanel.innerHTML = html;
+        })
+        .catch(() => {
+            document.getElementById('market-direction-panel').innerHTML = '<div class="error">Failed to load predictions</div>';
+            document.getElementById('movers-up-panel').innerHTML = '';
+            document.getElementById('movers-down-panel').innerHTML = '';
+            document.getElementById('all-predictions-panel').innerHTML = '';
+        });
+});
+</script>
+{% endblock %}

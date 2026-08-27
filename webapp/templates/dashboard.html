@@ -13,6 +13,14 @@
         </div>
     </section>
 
+    <!-- Training Status -->
+    <section class="card">
+        <h2>Model Training Status</h2>
+        <div id="training-status-panel">
+            <div class="loading">Checking training status...</div>
+        </div>
+    </section>
+
     <!-- Sentiment -->
     <section class="card">
         <h2>Market Sentiment</h2>
@@ -21,36 +29,21 @@
         </div>
     </section>
 
-    <!-- Daily Predictions -->
+    <!-- Popular Stocks -->
     <section class="card">
-        <h2>Today's Predictions</h2>
-        <p class="subtitle">ML model predictions for S&amp;P 500 stocks (updated after market close)</p>
-        <div id="predictions-table-container">
-            <div class="loading">Loading predictions...</div>
+        <h2>Most Popular Stocks</h2>
+        <p class="subtitle">Top 20 most-watched tickers — click any to see full analysis</p>
+        <div id="popular-grid" class="popular-grid">
+            <div class="loading">Loading popular stocks...</div>
         </div>
     </section>
 
-    <!-- Top Movers -->
+    <!-- Daily Predictions -->
     <section class="card">
-        <h2>Quick Lookup</h2>
-        <div class="ticker-grid" id="ticker-grid">
-            {% for sector, tickers in [
-                ("Tech", ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"]),
-                ("Finance", ["JPM", "GS", "BAC", "V", "MA", "BRK-B"]),
-                ("Healthcare", ["JNJ", "UNH", "LLY", "PFE", "ABBV", "TMO"]),
-                ("Energy", ["XOM", "CVX", "COP", "EOG", "SLB"]),
-                ("Consumer", ["WMT", "COST", "HD", "NKE", "SBUX", "DIS"]),
-                ("Industrial", ["BA", "CAT", "DE", "GE", "HON", "UPS"]),
-            ] %}
-            <div class="sector-group">
-                <h3>{{ sector }}</h3>
-                <div class="ticker-chips">
-                    {% for t in tickers %}
-                    <a href="/stock/{{ t }}" class="ticker-chip">{{ t }}</a>
-                    {% endfor %}
-                </div>
-            </div>
-            {% endfor %}
+        <h2>Today's ML Predictions</h2>
+        <p class="subtitle">Model predictions for top stocks (updated after market close)</p>
+        <div id="predictions-table-container">
+            <div class="loading">Loading predictions...</div>
         </div>
     </section>
 </div>
@@ -70,13 +63,45 @@ document.addEventListener('DOMContentLoaded', () => {
                 grid.innerHTML += `
                     <div class="index-card ${isUp ? 'up' : 'down'}">
                         <div class="index-name">${name}</div>
-                        <div class="index-price">${info.price.toLocaleString()}</div>
+                        <div class="index-price">$${info.price.toLocaleString()}</div>
                         <div class="index-change">${isUp ? '+' : ''}${info.change.toFixed(2)}%</div>
                     </div>`;
+            }
+            if (!Object.keys(data.indices || {}).length) {
+                grid.innerHTML = '<div class="muted">Market data unavailable</div>';
             }
         })
         .catch(() => {
             document.getElementById('indices-grid').innerHTML = '<div class="error">Failed to load market data</div>';
+        });
+
+    // Load training status
+    fetch('/api/training/status')
+        .then(r => r.json())
+        .then(data => {
+            const panel = document.getElementById('training-status-panel');
+            const models = data.models || {};
+            if (!Object.keys(models).length) {
+                panel.innerHTML = '<div class="muted">No models queued. Training will start automatically.</div>';
+                return;
+            }
+            let html = '';
+            for (const [name, info] of Object.entries(models)) {
+                const pct = info.total > 0 ? Math.round(info.progress / info.total * 100) : 0;
+                const stateClass = info.state === 'ready' ? 'status-ok' : info.state === 'error' ? 'status-error' : 'status-training';
+                const stateLabel = info.state === 'ready' ? '✓ Ready' : info.state === 'error' ? '✗ Error' : `Training... ${pct}%`;
+                html += `
+                    <div class="${stateClass}" style="margin-bottom:8px;">
+                        <strong>${name}</strong>: ${stateLabel}
+                        ${info.accuracy ? ` — Accuracy: ${(info.accuracy * 100).toFixed(1)}%` : ''}
+                        ${info.error ? ` — ${info.error}` : ''}
+                        ${info.state === 'training' ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>` : ''}
+                    </div>`;
+            }
+            panel.innerHTML = html;
+        })
+        .catch(() => {
+            document.getElementById('training-status-panel').innerHTML = '<div class="muted">Status unavailable</div>';
         });
 
     // Load sentiment
@@ -85,7 +110,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(data => {
             const panel = document.getElementById('sentiment-panel');
             if (data.error) {
-                panel.innerHTML = `<div class="error">${data.error}</div>`;
+                panel.innerHTML = `<div class="muted">${data.error}</div>`;
                 return;
             }
             const s = data.sentiment || {};
@@ -99,7 +124,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     </div>
                     <div class="sentiment-item">
                         <span class="label">News Sentiment</span>
-                        <span class="value ${s.news_sentiment_avg > 0 ? 'up' : 'down'}">${(s.news_sentiment_avg || 0).toFixed(3)}</span>
+                        <span class="value ${(s.news_sentiment_avg || 0) > 0 ? 'up' : 'down'}">${(s.news_sentiment_avg || 0).toFixed(3)}</span>
                     </div>
                     <div class="sentiment-item">
                         <span class="label">Conflict Score</span>
@@ -115,6 +140,30 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('sentiment-panel').innerHTML = '<div class="muted">Sentiment data unavailable</div>';
         });
 
+    // Load popular stocks
+    fetch('/api/popular')
+        .then(r => r.json())
+        .then(data => {
+            const grid = document.getElementById('popular-grid');
+            const stocks = data.popular || [];
+            if (!stocks.length) {
+                grid.innerHTML = '<div class="muted">Could not load popular stocks</div>';
+                return;
+            }
+            grid.innerHTML = stocks.map(s => {
+                const isUp = s.change >= 0;
+                return `
+                    <a href="/stock/${s.ticker}" class="popular-card ${isUp ? 'up' : 'down'}">
+                        <div class="popular-ticker">${s.ticker}</div>
+                        <div class="popular-price">$${s.price.toFixed(2)}</div>
+                        <div class="popular-change">${isUp ? '+' : ''}${s.change.toFixed(2)}%</div>
+                    </a>`;
+            }).join('');
+        })
+        .catch(() => {
+            document.getElementById('popular-grid').innerHTML = '<div class="muted">Popular stocks unavailable</div>';
+        });
+
     // Load predictions
     fetch('/api/predictions/daily')
         .then(r => r.json())
@@ -122,7 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const container = document.getElementById('predictions-table-container');
             const preds = data.predictions || {};
             if (Object.keys(preds).length === 0) {
-                container.innerHTML = '<div class="muted">No predictions available. Train the model first.</div>';
+                container.innerHTML = '<div class="muted">No predictions available yet. Model is training in the background...</div>';
                 return;
             }
             let html = `<table class="data-table">

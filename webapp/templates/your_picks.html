@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Your Picks — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="picks-page">
+    <h1>Your Picks</h1>
+    <p class="subtitle">Stocks you're following. Add stocks from any stock detail page.</p>
+
+    <section class="card">
+        <h2>Add a Ticker</h2>
+        <div class="input-row">
+            <input type="text" id="add-ticker-input" placeholder="Enter ticker (e.g., TSLA)">
+            <button onclick="addTickerFromInput()" class="btn btn-primary">Add</button>
+        </div>
+    </section>
+
+    <section class="card" id="picks-empty" style="display:none;">
+        <div class="muted" style="text-align:center; padding:40px 0;">
+            <p style="font-size:1.2rem;">No picks yet!</p>
+            <p>Search for a stock and click &#9734; <strong>Add to Your Picks</strong> to start tracking it here.</p>
+        </div>
+    </section>
+
+    <section id="picks-container"></section>
+
+    <!-- Day Trading Watchlist -->
+    <section class="card" style="margin-top:24px;">
+        <h2>Day Trading Watchlist</h2>
+        <p class="subtitle">Stocks you've enabled the day trading model for.</p>
+        <div id="daytrading-list">
+            <div class="muted">No stocks have day trading enabled. Toggle it on any stock's detail page.</div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function getPicks() {
+    return JSON.parse(localStorage.getItem('stockPicks') || '[]');
+}
+function savePicks(picks) {
+    localStorage.setItem('stockPicks', JSON.stringify(picks));
+}
+function removePick(ticker) {
+    const picks = getPicks().filter(t => t !== ticker);
+    savePicks(picks);
+    loadPicks();
+}
+function addTickerFromInput() {
+    const input = document.getElementById('add-ticker-input');
+    const ticker = input.value.trim().toUpperCase();
+    if (!ticker) return;
+    const picks = getPicks();
+    if (!picks.includes(ticker)) {
+        picks.push(ticker);
+        savePicks(picks);
+    }
+    input.value = '';
+    loadPicks();
+}
+
+function loadPicks() {
+    const picks = getPicks();
+    const container = document.getElementById('picks-container');
+    const empty = document.getElementById('picks-empty');
+
+    if (!picks.length) {
+        container.innerHTML = '';
+        empty.style.display = '';
+        return;
+    }
+    empty.style.display = 'none';
+
+    container.innerHTML = '<div class="loading" style="padding:12px;">Loading your picks...</div>';
+
+    // Load data for each pick
+    const promises = picks.map(ticker =>
+        fetch(`/api/stock/${ticker}`).then(r => r.json()).catch(() => ({ ticker, error: 'Failed' }))
+    );
+
+    Promise.all(promises).then(results => {
+        let html = `<div class="picks-grid">`;
+        for (const data of results) {
+            const ticker = data.ticker || '??';
+            if (data.error) {
+                html += `
+                    <div class="card pick-card">
+                        <div class="pick-header">
+                            <a href="/stock/${ticker}" class="pick-ticker">${ticker}</a>
+                            <button class="btn-icon" onclick="removePick('${ticker}')" title="Remove">&#10005;</button>
+                        </div>
+                        <div class="muted">${data.error}</div>
+                    </div>`;
+                continue;
+            }
+            const isUp = (data.change_1d || 0) >= 0;
+            html += `
+                <div class="card pick-card">
+                    <div class="pick-header">
+                        <a href="/stock/${ticker}" class="pick-ticker">${ticker}</a>
+                        <button class="btn-icon" onclick="removePick('${ticker}')" title="Remove">&#10005;</button>
+                    </div>
+                    <div class="pick-name">${data.name || ''}</div>
+                    <div class="pick-price">$${(data.current_price || 0).toFixed(2)}</div>
+                    <div class="pick-change ${isUp ? 'up' : 'down'}">
+                        ${isUp ? '+' : ''}${(data.change_1d || 0).toFixed(2)}% today
+                    </div>
+                    <div class="pick-stats">
+                        <span class="${(data.change_5d || 0) >= 0 ? 'up' : 'down'}">${(data.change_5d || 0).toFixed(1)}% 5d</span>
+                        <span class="${(data.change_20d || 0) >= 0 ? 'up' : 'down'}">${(data.change_20d || 0).toFixed(1)}% 20d</span>
+                    </div>
+                </div>`;
+        }
+        html += `</div>`;
+        container.innerHTML = html;
+    });
+
+    // Load ML predictions for picks
+    picks.forEach(ticker => {
+        fetch(`/api/stock/${ticker}/prediction`).then(r => r.json()).catch(() => null);
+    });
+
+    // Day Trading Watchlist
+    const dtStocks = JSON.parse(localStorage.getItem('dayTradingStocks') || '[]');
+    const dtPanel = document.getElementById('daytrading-list');
+    if (dtStocks.length) {
+        dtPanel.innerHTML = dtStocks.map(t =>
+            `<a href="/stock/${t}" class="ticker-chip">${t}</a>`
+        ).join(' ');
+    }
+}
+
+document.addEventListener('DOMContentLoaded', loadPicks);
+</script>
+{% endblock %}

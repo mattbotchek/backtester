@@ -8,6 +8,19 @@
         <div class="loading">Loading stock data...</div>
     </div>
 
+    <!-- User actions -->
+    <section class="card action-bar">
+        <div class="action-row">
+            <button id="btn-pick" class="btn btn-outline" onclick="togglePick('{{ ticker }}')">
+                &#9734; Add to Your Picks
+            </button>
+            <label class="toggle-label">
+                <input type="checkbox" id="daytrading-toggle" onchange="toggleDayTrading('{{ ticker }}')">
+                <span>Enable Day Trading Model</span>
+            </label>
+        </div>
+    </section>
+
     <!-- Price Chart -->
     <section class="card">
         <h2>Price Chart (60 days)</h2>
@@ -17,15 +30,36 @@
     <!-- ML Prediction -->
     <section class="card">
         <h2>ML Prediction</h2>
+        <div id="training-progress"></div>
         <div id="prediction-panel">
             <div class="loading">Loading prediction...</div>
+        </div>
+    </section>
+
+    <!-- Day Trading (hidden by default) -->
+    <section class="card" id="daytrading-section" style="display:none;">
+        <h2>Day Trading Model <span class="badge novel">OPT-IN</span></h2>
+        <p class="subtitle">Intraday predictions using 5-minute bars. This model is not run automatically — you enabled it for this stock.</p>
+        <div id="daytrading-panel">
+            <div class="muted">Day trading model available via CLI: <code>python main.py --mode ml-horizons-train --horizon intraday</code></div>
         </div>
     </section>
 
     <!-- Strategy Results -->
     <section class="card">
         <h2>Strategy Analysis</h2>
-        <p class="subtitle">All 22 strategies applied to {{ ticker }} (1-year backtest)</p>
+        <div class="input-row" style="margin-bottom:12px;">
+            <label style="font-size:0.9rem;color:var(--text-muted);margin-right:8px;">Timeframe:</label>
+            <select id="detail-timeframe" class="select-input" onchange="loadStrategies()">
+                <option value="1mo">1 Month</option>
+                <option value="3mo">3 Months</option>
+                <option value="6mo">6 Months</option>
+                <option value="ytd" selected>Year to Date</option>
+                <option value="1y">1 Year</option>
+                <option value="2y">2 Years</option>
+                <option value="5y">5 Years</option>
+            </select>
+        </div>
         <div id="strategies-panel">
             <div class="loading">Running strategies...</div>
         </div>
@@ -37,7 +71,82 @@
 <script>
 const TICKER = '{{ ticker }}';
 
+// ── Picks persistence (localStorage) ──
+function getPicks() {
+    return JSON.parse(localStorage.getItem('stockPicks') || '[]');
+}
+function togglePick(ticker) {
+    let picks = getPicks();
+    const idx = picks.indexOf(ticker);
+    if (idx >= 0) { picks.splice(idx, 1); } else { picks.push(ticker); }
+    localStorage.setItem('stockPicks', JSON.stringify(picks));
+    updatePickButton(ticker);
+}
+function updatePickButton(ticker) {
+    const btn = document.getElementById('btn-pick');
+    const isPicked = getPicks().includes(ticker);
+    btn.innerHTML = isPicked ? '&#9733; In Your Picks' : '&#9734; Add to Your Picks';
+    btn.classList.toggle('btn-active', isPicked);
+}
+
+// ── Day Trading persistence (localStorage) ──
+function getDayTradingStocks() {
+    return JSON.parse(localStorage.getItem('dayTradingStocks') || '[]');
+}
+function toggleDayTrading(ticker) {
+    let stocks = getDayTradingStocks();
+    const cb = document.getElementById('daytrading-toggle');
+    if (cb.checked) {
+        if (!stocks.includes(ticker)) stocks.push(ticker);
+    } else {
+        stocks = stocks.filter(t => t !== ticker);
+    }
+    localStorage.setItem('dayTradingStocks', JSON.stringify(stocks));
+    document.getElementById('daytrading-section').style.display = cb.checked ? '' : 'none';
+}
+
+function loadStrategies() {
+    const tf = document.getElementById('detail-timeframe').value;
+    const panel = document.getElementById('strategies-panel');
+    panel.innerHTML = '<div class="loading">Running strategies...</div>';
+
+    fetch(`/api/stock/${TICKER}/strategies?timeline=${tf}`)
+        .then(r => r.json())
+        .then(data => {
+            const strats = data.strategies || [];
+            if (!strats.length) {
+                panel.innerHTML = '<div class="muted">No strategy results</div>';
+                return;
+            }
+            let html = `<table class="data-table">
+                <thead><tr><th>Strategy</th><th>Type</th><th>Total Return</th><th>Win Rate</th><th>Trades</th><th>Avg Return</th></tr></thead>
+                <tbody>`;
+            for (const s of strats) {
+                const isUp = s.total_return > 0;
+                html += `<tr>
+                    <td>${s.name}</td>
+                    <td>${s.is_novel ? '<span class="badge novel">NOVEL</span>' : '<span class="badge known">KNOWN</span>'}</td>
+                    <td class="${isUp ? 'up' : 'down'}">${s.total_return.toFixed(2)}%</td>
+                    <td>${s.win_rate.toFixed(1)}%</td>
+                    <td>${s.num_trades}</td>
+                    <td class="${s.avg_return > 0 ? 'up' : 'down'}">${s.avg_return.toFixed(2)}%</td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            panel.innerHTML = html;
+        })
+        .catch(() => {
+            panel.innerHTML = '<div class="error">Failed to load strategies</div>';
+        });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    // Restore pick/daytrading state
+    updatePickButton(TICKER);
+    const dtEnabled = getDayTradingStocks().includes(TICKER);
+    document.getElementById('daytrading-toggle').checked = dtEnabled;
+    document.getElementById('daytrading-section').style.display = dtEnabled ? '' : 'none';
+
     // Load stock data
     fetch(`/api/stock/${TICKER}`)
         .then(r => r.json())
@@ -91,6 +200,23 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
+    // Load training progress
+    fetch('/api/training/status')
+        .then(r => r.json())
+        .then(data => {
+            const panel = document.getElementById('training-progress');
+            const models = data.models || {};
+            const defaultModel = models['default'];
+            if (defaultModel && defaultModel.state === 'training') {
+                const pct = defaultModel.total > 0 ? Math.round(defaultModel.progress / defaultModel.total * 100) : 0;
+                panel.innerHTML = `
+                    <div class="status-training" style="margin-bottom:12px;">
+                        Model is training... ${pct}%
+                        <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+                    </div>`;
+            }
+        }).catch(() => {});
+
     // Load prediction
     fetch(`/api/stock/${TICKER}/prediction`)
         .then(r => r.json())
@@ -109,39 +235,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>`;
         })
         .catch(() => {
-            document.getElementById('prediction-panel').innerHTML = '<div class="muted">Model not trained. Run: python main.py --mode ml-train</div>';
+            document.getElementById('prediction-panel').innerHTML = '<div class="muted">Model not trained yet. Training starts automatically on server boot.</div>';
         });
 
     // Load strategies
-    fetch(`/api/stock/${TICKER}/strategies`)
-        .then(r => r.json())
-        .then(data => {
-            const panel = document.getElementById('strategies-panel');
-            const strats = data.strategies || [];
-            if (!strats.length) {
-                panel.innerHTML = '<div class="muted">No strategy results</div>';
-                return;
-            }
-            let html = `<table class="data-table">
-                <thead><tr><th>Strategy</th><th>Type</th><th>Total Return</th><th>Win Rate</th><th>Trades</th><th>Avg Return</th></tr></thead>
-                <tbody>`;
-            for (const s of strats) {
-                const isUp = s.total_return > 0;
-                html += `<tr>
-                    <td>${s.name}</td>
-                    <td>${s.is_novel ? '<span class="badge novel">NOVEL</span>' : '<span class="badge known">KNOWN</span>'}</td>
-                    <td class="${isUp ? 'up' : 'down'}">${s.total_return.toFixed(2)}%</td>
-                    <td>${s.win_rate.toFixed(1)}%</td>
-                    <td>${s.num_trades}</td>
-                    <td class="${s.avg_return > 0 ? 'up' : 'down'}">${s.avg_return.toFixed(2)}%</td>
-                </tr>`;
-            }
-            html += '</tbody></table>';
-            panel.innerHTML = html;
-        })
-        .catch(() => {
-            document.getElementById('strategies-panel').innerHTML = '<div class="error">Failed to load strategies</div>';
-        });
+    loadStrategies();
 });
 </script>
 {% endblock %}

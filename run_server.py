@@ -80,13 +80,13 @@ def run_prediction_daemon(interval_minutes: int = 60):
     while not shutdown_event.is_set():
         try:
             from ml.model import StockPredictor
-            from webapp.app import SP500_TICKERS
+            from webapp.app import POPULAR_TICKERS
 
             predictor = StockPredictor()
             predictor.load()
 
             up_count, down_count = 0, 0
-            for ticker in SP500_TICKERS[:50]:
+            for ticker in POPULAR_TICKERS[:20]:
                 try:
                     pred = predictor.predict_ticker(ticker)
                     if pred.direction == 1:
