@@ -418,8 +418,8 @@ def main():
             from ml.backtest import walk_forward_backtest
             test_tickers = args.tickers or ML_TRAINING_TICKERS[:15]
             result = walk_forward_backtest(
-                tickers=test_tickers,
-                test_tickers=test_tickers,
+                tickers=ML_TRAINING_TICKERS,  # Train on full pool
+                test_tickers=test_tickers,     # Test on subset
             )
             print(result.summary())
 

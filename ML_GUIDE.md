@@ -136,9 +136,23 @@ print(predictor._training_stats)
 
 ### Cross-Validation Interpretation
 
-- **Good**: CV accuracy 0.40-0.55, low std (< 0.03) — model learns some real signal
-- **Suspicious**: CV accuracy > 0.60 — likely overfitting to some pattern
-- **Bad**: CV accuracy < 0.33 — model worse than random (3-class)
+- **Good**: CV accuracy 0.52-0.58, low std (< 0.03) — model learns some real signal
+- **Suspicious**: CV accuracy > 0.65 — likely overfitting to some pattern
+- **Expected**: CV ~55%, walk-forward ~51% (binary UP/DOWN, 10-day horizon)
+- **Bad**: CV accuracy < 0.50 — model worse than random (binary)
+
+### Tested Results (as of initial training)
+
+| Metric | Value |
+|--------|-------|
+| Training samples | 69,580 (70 tickers × ~994 days) |
+| Features | 52 |
+| CV accuracy (binary) | 55.5% ± 1.9% |
+| Walk-forward accuracy | 50.7% (on 15 test tickers) |
+| UP precision / recall | 54% / 63% |
+| DOWN precision / recall | 46% / 36% |
+| Horizon | 10 trading days |
+| Threshold | 0% (binary UP/DOWN) |
 
 ## Headless / 24/7 Mode
 

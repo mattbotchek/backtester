@@ -18,10 +18,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import (
-    GradientBoostingClassifier,
     GradientBoostingRegressor,
+    HistGradientBoostingClassifier,
     RandomForestClassifier,
-    RandomForestRegressor,
     VotingClassifier,
 )
 from sklearn.model_selection import TimeSeriesSplit
@@ -53,7 +52,7 @@ class Prediction:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
     def __repr__(self):
-        arrow = {"UP": "↑", "DOWN": "↓", "FLAT": "→"}.get(self.direction, "?")
+        arrow = {"UP": "^", "DOWN": "v", "FLAT": "-"}.get(self.direction, "?")
         return (
             f"{self.ticker} {arrow} {self.predicted_return_pct:+.2f}% "
             f"(confidence: {self.confidence:.0%}) "
@@ -70,24 +69,28 @@ class StockPredictor:
         prediction = predictor.predict("TSLA")
     """
 
-    def __init__(self, horizon: int = 5, threshold: float = 0.02):
+    def __init__(self, horizon: int = 10, threshold: float = 0.0):
         self.horizon = horizon
         self.threshold = threshold
         self.scaler = StandardScaler()
 
-        # Classification ensemble
+        # Binary classification ensemble (UP=1 vs DOWN=0)
         self.classifier = VotingClassifier(
             estimators=[
                 ("rf", RandomForestClassifier(
-                    n_estimators=200, max_depth=10, min_samples_leaf=20,
+                    n_estimators=300, max_depth=8, min_samples_leaf=30,
+                    max_features="sqrt",
                     random_state=42, n_jobs=-1
                 )),
-                ("gbm", GradientBoostingClassifier(
-                    n_estimators=150, max_depth=5, min_samples_leaf=20,
-                    learning_rate=0.05, subsample=0.8, random_state=42
+                ("hgb", HistGradientBoostingClassifier(
+                    max_iter=300, max_depth=6, min_samples_leaf=30,
+                    learning_rate=0.03, max_bins=128,
+                    l2_regularization=1.0,
+                    early_stopping=True, validation_fraction=0.1,
+                    random_state=42
                 )),
                 ("mlp", MLPClassifier(
-                    hidden_layer_sizes=(64, 32), max_iter=500,
+                    hidden_layer_sizes=(128, 64, 32), max_iter=500,
                     early_stopping=True, random_state=42
                 )),
             ],
@@ -96,8 +99,8 @@ class StockPredictor:
 
         # Regression model for magnitude
         self.regressor = GradientBoostingRegressor(
-            n_estimators=150, max_depth=5, min_samples_leaf=20,
-            learning_rate=0.05, subsample=0.8, random_state=42
+            n_estimators=200, max_depth=5, min_samples_leaf=20,
+            learning_rate=0.03, subsample=0.8, random_state=42
         )
 
         self.feature_names: list[str] = []
@@ -142,9 +145,17 @@ class StockPredictor:
         if not all_features:
             raise ValueError("No valid training data collected.")
 
-        X = pd.concat(all_features)
-        y_cls = pd.concat(all_cls_targets)
-        y_reg = pd.concat(all_reg_targets)
+        # Reset indices to avoid duplicate datetime indices across tickers
+        X = pd.concat(all_features, ignore_index=True)
+        y_cls = pd.concat(all_cls_targets, ignore_index=True)
+        y_reg = pd.concat(all_reg_targets, ignore_index=True)
+
+        # Drop any remaining NaN/inf values
+        X = X.replace([np.inf, -np.inf], np.nan)
+        mask = X.notna().all(axis=1) & y_cls.notna() & y_reg.notna()
+        X = X[mask].reset_index(drop=True)
+        y_cls = y_cls[mask].reset_index(drop=True)
+        y_reg = y_reg[mask].reset_index(drop=True)
 
         return X, y_cls, y_reg
 
@@ -222,8 +233,8 @@ class StockPredictor:
 
         # Classification prediction
         direction_code = self.classifier.predict(X_scaled)[0]
-        direction_map = {1: "UP", -1: "DOWN", 0: "FLAT"}
-        direction = direction_map.get(direction_code, "FLAT")
+        direction_map = {1: "UP", -1: "DOWN", 0: "DOWN"}
+        direction = direction_map.get(direction_code, "DOWN")
 
         # Confidence from probability
         proba = self.classifier.predict_proba(X_scaled)[0]

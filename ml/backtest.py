@@ -1,7 +1,8 @@
 """ML Backtester — walk-forward testing without future data leakage.
 
 Simulates real-world usage: at each point in time, the model only knows
-past data. Trains on a rolling window and predicts the next period.
+past data. Trains on a rolling window across ALL tickers simultaneously,
+then predicts the next period.
 """
 
 import logging
@@ -12,6 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
 
 from .features import compute_features, create_target, create_regression_target
 from .model import StockPredictor, Prediction
@@ -47,43 +49,33 @@ class WalkForwardResult:
 def walk_forward_backtest(
     tickers: list[str],
     test_tickers: list[str] | None = None,
-    train_period: str = "3y",
+    train_period: str = "5y",
     total_history: str = "5y",
-    horizon: int = 5,
-    threshold: float = 0.02,
+    horizon: int = 10,
+    threshold: float = 0.0,
     n_splits: int = 5,
     min_train_size: int = 500,
 ) -> WalkForwardResult:
-    """Run a walk-forward (expanding window) backtest.
+    """Run a walk-forward (expanding window) backtest across ALL tickers.
 
-    Splits data chronologically: trains on [0:t], predicts [t:t+horizon],
-    then expands training window forward.
-
-    Args:
-        tickers: Tickers used for training.
-        test_tickers: Tickers to test on (defaults to training tickers).
-        train_period: Not used directly — the split is done on downloaded data.
-        total_history: How much history to download.
-        horizon: Prediction horizon in days.
-        threshold: Classification threshold for UP/DOWN.
-        n_splits: Number of walk-forward splits.
-        min_train_size: Minimum training samples before first prediction.
+    Trains on all tickers' data up to time T, then tests on all tickers
+    from T to T+window. This mirrors real deployment where the model is
+    trained on broad market data.
     """
     if test_tickers is None:
         test_tickers = tickers
 
     result = WalkForwardResult()
-    all_true = []
-    all_pred = []
-    all_true_returns = []
-    all_pred_returns = []
 
-    for ticker in test_tickers:
+    # Step 1: Download and prepare all data upfront
+    logger.info("Downloading data for %d tickers...", len(tickers))
+    ticker_data: dict[str, tuple[pd.DataFrame, pd.Series, pd.Series]] = {}
+
+    for ticker in set(tickers) | set(test_tickers):
         try:
-            logger.info("Walk-forward testing %s...", ticker)
             data = yfinance.Ticker(ticker).history(period=total_history, interval="1d")
-            if data.empty or len(data) < min_train_size + horizon * n_splits:
-                logger.warning("Insufficient data for %s.", ticker)
+            if data.empty or len(data) < 300:
+                logger.warning("Insufficient data for %s, skipping.", ticker)
                 continue
 
             features = compute_features(data)
@@ -95,61 +87,124 @@ def walk_forward_backtest(
                 .intersection(cls_target.dropna().index)
                 .intersection(reg_target.dropna().index)
             )
+            if len(common_idx) < 200:
+                continue
+
             features = features.loc[common_idx]
             cls_target = cls_target.loc[common_idx]
             reg_target = reg_target.loc[common_idx]
 
-            total = len(features)
-            split_size = (total - min_train_size) // n_splits
+            # Replace inf with NaN and drop
+            features = features.replace([np.inf, -np.inf], np.nan).dropna()
+            common_idx = features.index.intersection(cls_target.index).intersection(reg_target.index)
+            features = features.loc[common_idx]
+            cls_target = cls_target.loc[common_idx]
+            reg_target = reg_target.loc[common_idx]
 
-            for i in range(n_splits):
-                train_end = min_train_size + i * split_size
-                test_start = train_end
-                test_end = min(test_start + split_size, total)
-
-                if test_end <= test_start:
-                    continue
-
-                X_train = features.iloc[:train_end]
-                y_cls_train = cls_target.iloc[:train_end]
-                y_reg_train = reg_target.iloc[:train_end]
-                X_test = features.iloc[test_start:test_end]
-                y_cls_test = cls_target.iloc[test_start:test_end]
-                y_reg_test = reg_target.iloc[test_start:test_end]
-
-                # Train a fresh model on the expanding window
-                predictor = StockPredictor(horizon=horizon, threshold=threshold)
-                predictor.feature_names = list(X_train.columns)
-
-                from sklearn.preprocessing import StandardScaler
-                predictor.scaler = StandardScaler()
-                X_train_scaled = predictor.scaler.fit_transform(X_train)
-                X_test_scaled = predictor.scaler.transform(X_test)
-
-                predictor.classifier.fit(X_train_scaled, y_cls_train)
-                predictor.regressor.fit(X_train_scaled, y_reg_train)
-
-                cls_preds = predictor.classifier.predict(X_test_scaled)
-                reg_preds = predictor.regressor.predict(X_test_scaled)
-
-                all_true.extend(y_cls_test.values)
-                all_pred.extend(cls_preds)
-                all_true_returns.extend(y_reg_test.values)
-                all_pred_returns.extend(reg_preds)
-
-                for j in range(len(X_test)):
-                    result.predictions.append({
-                        "ticker": ticker,
-                        "date": str(X_test.index[j]),
-                        "true_direction": int(y_cls_test.iloc[j]),
-                        "pred_direction": int(cls_preds[j]),
-                        "true_return": float(y_reg_test.iloc[j]),
-                        "pred_return": float(reg_preds[j]),
-                    })
-
+            ticker_data[ticker] = (features, cls_target, reg_target)
+            logger.info("  %s: %d samples", ticker, len(features))
         except Exception as e:
-            logger.warning("Error in walk-forward for %s: %s", ticker, e)
+            logger.warning("Error downloading %s: %s", ticker, e)
 
+    if not ticker_data:
+        logger.error("No valid data collected.")
+        return result
+
+    # Step 2: Find common date range across all tickers
+    all_dates = sorted(set().union(*(d[0].index for d in ticker_data.values())))
+    total_dates = len(all_dates)
+    logger.info("Total unique dates: %d", total_dates)
+
+    # Step 3: Walk-forward splits based on dates
+    split_size = (total_dates - min_train_size) // n_splits
+    if split_size < 10:
+        logger.error("Not enough data for %d splits.", n_splits)
+        return result
+
+    all_true = []
+    all_pred = []
+    all_true_returns = []
+    all_pred_returns = []
+
+    for i in range(n_splits):
+        train_end_idx = min_train_size + i * split_size
+        test_end_idx = min(train_end_idx + split_size, total_dates)
+        if test_end_idx <= train_end_idx:
+            continue
+
+        split_date = all_dates[train_end_idx]
+        test_end_date = all_dates[test_end_idx - 1]
+        logger.info(
+            "Split %d/%d: train up to %s, test to %s",
+            i + 1, n_splits, split_date, test_end_date
+        )
+
+        # Collect training data from ALL tickers
+        train_X_parts, train_y_cls_parts, train_y_reg_parts = [], [], []
+        for ticker in tickers:
+            if ticker not in ticker_data:
+                continue
+            feat, cls_t, reg_t = ticker_data[ticker]
+            train_mask = feat.index < split_date
+            if train_mask.sum() > 50:
+                train_X_parts.append(feat[train_mask])
+                train_y_cls_parts.append(cls_t[train_mask])
+                train_y_reg_parts.append(reg_t[train_mask])
+
+        if not train_X_parts:
+            continue
+
+        X_train = pd.concat(train_X_parts, ignore_index=True)
+        y_cls_train = pd.concat(train_y_cls_parts, ignore_index=True)
+        y_reg_train = pd.concat(train_y_reg_parts, ignore_index=True)
+
+        # Train model on ALL tickers
+        predictor = StockPredictor(horizon=horizon, threshold=threshold)
+        predictor.feature_names = list(X_train.columns)
+        predictor.scaler = StandardScaler()
+        X_train_scaled = predictor.scaler.fit_transform(X_train)
+        predictor.classifier.fit(X_train_scaled, y_cls_train)
+        predictor.regressor.fit(X_train_scaled, y_reg_train)
+
+        # Test on test tickers
+        for ticker in test_tickers:
+            if ticker not in ticker_data:
+                continue
+            feat, cls_t, reg_t = ticker_data[ticker]
+            test_mask = (feat.index >= split_date) & (feat.index <= test_end_date)
+            if test_mask.sum() == 0:
+                continue
+
+            X_test = feat[test_mask]
+            y_cls_test = cls_t[test_mask]
+            y_reg_test = reg_t[test_mask]
+
+            # Align feature columns
+            missing_cols = set(predictor.feature_names) - set(X_test.columns)
+            if missing_cols:
+                continue
+            X_test = X_test[predictor.feature_names]
+
+            X_test_scaled = predictor.scaler.transform(X_test)
+            cls_preds = predictor.classifier.predict(X_test_scaled)
+            reg_preds = predictor.regressor.predict(X_test_scaled)
+
+            all_true.extend(y_cls_test.values)
+            all_pred.extend(cls_preds)
+            all_true_returns.extend(y_reg_test.values)
+            all_pred_returns.extend(reg_preds)
+
+            for j in range(len(X_test)):
+                result.predictions.append({
+                    "ticker": ticker,
+                    "date": str(X_test.index[j]),
+                    "true_direction": int(y_cls_test.iloc[j]),
+                    "pred_direction": int(cls_preds[j]),
+                    "true_return": float(y_reg_test.iloc[j]),
+                    "pred_return": float(reg_preds[j]),
+                })
+
+    # Step 4: Compute aggregate metrics
     if all_true:
         all_true = np.array(all_true)
         all_pred = np.array(all_pred)

@@ -96,27 +96,53 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         feat["day_of_week"] = 0
 
-    # Drop raw OHLCV and intermediate columns
-    feature_cols = [c for c in feat.columns if c not in ["Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits"]]
+    # Lag features (crucial for short-term prediction)
+    for lag in [1, 2, 3, 5]:
+        feat[f"return_lag_{lag}"] = feat["return_1d"].shift(lag)
+        feat[f"volume_ratio_lag_{lag}"] = feat["volume_ratio"].shift(lag)
+
+    # Rolling Sharpe (risk-adjusted return signal)
+    feat["sharpe_20d"] = (
+        feat["return_1d"].rolling(20).mean() / feat["return_1d"].rolling(20).std()
+    )
+
+    # Price position relative to 52-week high/low
+    feat["pct_from_52w_high"] = feat["Close"] / feat["High"].rolling(252).max() - 1
+    feat["pct_from_52w_low"] = feat["Close"] / feat["Low"].rolling(252).min() - 1
+
+    # Consecutive up/down days
+    up_streak = (feat["return_1d"] > 0).astype(int)
+    feat["up_streak"] = up_streak.groupby((up_streak != up_streak.shift()).cumsum()).cumsum()
+    down_streak = (feat["return_1d"] < 0).astype(int)
+    feat["down_streak"] = down_streak.groupby((down_streak != down_streak.shift()).cumsum()).cumsum()
+
+    # Drop raw OHLCV, intermediate, and yfinance metadata columns
+    drop_cols = {"Open", "High", "Low", "Close", "Volume", "Dividends",
+                 "Stock Splits", "Capital Gains"}
+    feature_cols = [c for c in feat.columns if c not in drop_cols]
 
     return feat[feature_cols].dropna()
 
 
-def create_target(df: pd.DataFrame, horizon: int = 5, threshold: float = 0.02) -> pd.Series:
+def create_target(df: pd.DataFrame, horizon: int = 5, threshold: float = 0.0) -> pd.Series:
     """Create forward-looking classification target.
 
     Args:
         df: DataFrame with 'Close' column.
         horizon: Number of days to look ahead.
         threshold: Minimum return to classify as UP or DOWN.
+                   Default 0.0 = binary (UP=1 if positive, DOWN=-1 if negative).
 
     Returns:
-        Series with values: 1 (UP), -1 (DOWN), 0 (FLAT).
+        Series with values: 1 (UP), -1 (DOWN). FLAT (0) only if threshold > 0.
     """
     future_return = df["Close"].pct_change(horizon).shift(-horizon)
     target = pd.Series(0, index=df.index, name="target")
     target[future_return > threshold] = 1
-    target[future_return < -threshold] = -1
+    target[future_return <= -threshold] = -1
+    # For binary (threshold=0), eliminate exact 0 returns
+    if threshold == 0:
+        target[future_return == 0] = 1  # tie-break to UP
     return target
 
 
