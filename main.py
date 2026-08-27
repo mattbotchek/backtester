@@ -318,6 +318,7 @@ Examples:
         choices=[
             "interactive", "backtest", "compare", "headless",
             "ml-train", "ml-predict", "ml-backtest", "ml-headless",
+            "ml-horizons-train", "ml-horizons-backtest",
             "list",
         ],
         default="interactive",
@@ -332,6 +333,10 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--output", "-o", default=None, help="Output CSV file")
     parser.add_argument("--model", default="stock_predictor", help="ML model name")
+    parser.add_argument(
+        "--horizon", nargs="+", default=None,
+        help="Horizon names for multi-horizon mode (intraday, short_1d, short_5d, medium_20d, long_60d, long_252d)",
+    )
     return parser
 
 
@@ -431,6 +436,33 @@ def main():
                 interval_seconds=args.interval,
                 output_file=args.output,
             )
+
+        case "ml-horizons-train":
+            from ml.multi_horizon import train_all_horizons
+            horizons = args.horizon
+            results = train_all_horizons(ML_TRAINING_TICKERS, horizons=horizons)
+            for name, stats in results.items():
+                if "error" in stats:
+                    print(f"  {name}: FAILED - {stats['error']}")
+                else:
+                    print(f"  {name}: CV {stats['cv_accuracy_mean']:.3f} +/- {stats['cv_accuracy_std']:.3f}  ({stats['n_samples']} samples)")
+
+        case "ml-horizons-backtest":
+            from ml.multi_horizon import walk_forward_horizon, HORIZONS
+            horizons = args.horizon or list(HORIZONS.keys())
+            for name in horizons:
+                if name == "intraday":
+                    print(f"  {name}: skipped (intraday walk-forward not supported)")
+                    continue
+                print(f"--- {name} ---")
+                result = walk_forward_horizon(name, ML_TRAINING_TICKERS)
+                if "error" in result:
+                    print(f"  ERROR: {result['error']}")
+                else:
+                    print(f"  Accuracy: {result['accuracy']:.3f}")
+                    print(f"  Directional Accuracy: {result['directional_accuracy']:.3f}")
+                    print(f"  Predictions: {result['total_predictions']}")
+                    print(result['classification_report'])
 
 
 if __name__ == "__main__":
