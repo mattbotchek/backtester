@@ -26,10 +26,8 @@
     <!-- Day Trading Watchlist -->
     <section class="card" style="margin-top:24px;">
         <h2>Day Trading Watchlist</h2>
-        <p class="subtitle">Stocks you've enabled the day trading model for.</p>
-        <div id="daytrading-list">
-            <div class="muted">No stocks have day trading enabled. Toggle it on any stock's detail page.</div>
-        </div>
+        <p class="subtitle">Stocks you've enabled the day trading model for. Each shows a live candlestick chart and prediction.</p>
+        <div id="daytrading-list"></div>
     </section>
 </div>
 {% endblock %}
@@ -74,7 +72,6 @@ function loadPicks() {
 
     container.innerHTML = '<div class="loading" style="padding:12px;">Loading your picks...</div>';
 
-    // Load data for each pick
     const promises = picks.map(ticker =>
         fetch(`/api/stock/${ticker}`).then(r => r.json()).catch(() => ({ ticker, error: 'Failed' }))
     );
@@ -116,19 +113,110 @@ function loadPicks() {
         container.innerHTML = html;
     });
 
-    // Load ML predictions for picks
-    picks.forEach(ticker => {
-        fetch(`/api/stock/${ticker}/prediction`).then(r => r.json()).catch(() => null);
-    });
+    // Load day trading section
+    loadDayTradingWatchlist();
+}
 
-    // Day Trading Watchlist
+function loadDayTradingWatchlist() {
     const dtStocks = JSON.parse(localStorage.getItem('dayTradingStocks') || '[]');
-    const dtPanel = document.getElementById('daytrading-list');
-    if (dtStocks.length) {
-        dtPanel.innerHTML = dtStocks.map(t =>
-            `<a href="/stock/${t}" class="ticker-chip">${t}</a>`
-        ).join(' ');
+    const panel = document.getElementById('daytrading-list');
+
+    if (!dtStocks.length) {
+        panel.innerHTML = '<div class="muted">No stocks have day trading enabled. Toggle it on any stock\'s detail page.</div>';
+        return;
     }
+
+    let html = '';
+    dtStocks.forEach((ticker, idx) => {
+        html += `
+            <div class="card dt-watchlist-card" style="margin-bottom:16px;">
+                <div class="pick-header">
+                    <a href="/stock/${ticker}" class="pick-ticker">${ticker}</a>
+                    <div>
+                        <button class="btn btn-outline btn-sm" onclick="refreshDTPick('${ticker}')">Refresh</button>
+                    </div>
+                </div>
+                <div id="dt-pred-${ticker}" class="dt-pred-inline">
+                    <div class="loading">Loading prediction...</div>
+                </div>
+                <div id="dt-chart-${ticker}" style="height:300px;">
+                    <div class="loading">Loading chart...</div>
+                </div>
+            </div>`;
+    });
+    panel.innerHTML = html;
+
+    // Load charts and predictions for each
+    dtStocks.forEach(ticker => {
+        loadDTPickChart(ticker);
+        loadDTPickPrediction(ticker);
+    });
+}
+
+function loadDTPickChart(ticker) {
+    fetch(`/api/stock/${ticker}/intraday?interval=5m&period=5d`)
+        .then(r => r.json())
+        .then(data => {
+            const el = document.getElementById(`dt-chart-${ticker}`);
+            if (data.error || !data.bars || !data.bars.length) {
+                el.innerHTML = `<div class="muted">${data.error || 'No data'}</div>`;
+                return;
+            }
+            const bars = data.bars;
+            Plotly.newPlot(el, [{
+                x: bars.map(b => b.time),
+                open: bars.map(b => b.open),
+                high: bars.map(b => b.high),
+                low: bars.map(b => b.low),
+                close: bars.map(b => b.close),
+                type: 'candlestick',
+                increasing: { line: { color: '#16a34a' }, fillcolor: '#bbf7d0' },
+                decreasing: { line: { color: '#dc2626' }, fillcolor: '#fecaca' },
+            }], {
+                margin: { t: 5, r: 30, b: 30, l: 50 },
+                xaxis: { type: 'date', rangeslider: { visible: false } },
+                yaxis: { title: 'Price' },
+                plot_bgcolor: '#fafafa',
+                paper_bgcolor: 'transparent',
+                font: { family: 'system-ui', size: 11 },
+                height: 280,
+            }, { responsive: true });
+        })
+        .catch(() => {
+            document.getElementById(`dt-chart-${ticker}`).innerHTML = '<div class="error">Chart failed</div>';
+        });
+}
+
+function loadDTPickPrediction(ticker) {
+    fetch(`/api/stock/${ticker}/daytrading/predict`)
+        .then(r => r.json())
+        .then(data => {
+            const el = document.getElementById(`dt-pred-${ticker}`);
+            if (data.model_status === 'not_trained') {
+                el.innerHTML = '<div class="muted">Model not trained — <a href="/stock/' + ticker + '">go to stock page to train</a></div>';
+                return;
+            }
+            if (data.direction === 'N/A') {
+                el.innerHTML = `<div class="muted">${data.message || 'Prediction unavailable'}</div>`;
+                return;
+            }
+            const isUp = data.direction === 'UP';
+            el.innerHTML = `
+                <div class="dt-pred-row ${isUp ? 'up' : 'down'}">
+                    <span class="dt-pred-dir">${isUp ? '&#9650;' : '&#9660;'} ${data.direction}</span>
+                    <span class="dt-pred-ret">${data.predicted_return}%</span>
+                    <span class="dt-pred-conf">Conf: ${data.confidence}%</span>
+                    <span class="dt-pred-horizon">Next ${data.horizon_bars} × ${data.interval}</span>
+                </div>`;
+        })
+        .catch(() => {
+            document.getElementById(`dt-pred-${ticker}`).innerHTML = '<div class="muted">Prediction unavailable</div>';
+        });
+}
+
+function refreshDTPick(ticker) {
+    loadDTPickChart(ticker);
+    loadDTPickPrediction(ticker);
 }
 
 document.addEventListener('DOMContentLoaded', loadPicks);

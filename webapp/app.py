@@ -482,6 +482,138 @@ async def api_sentiment():
         return {"error": str(e)}
 
 
+@app.get("/api/stock/{ticker}/intraday")
+async def api_intraday(
+    ticker: str,
+    period: str = Query("5d", description="Data period"),
+    interval: str = Query("5m", description="Bar interval"),
+):
+    """Get intraday OHLCV data for candlestick charts."""
+    try:
+        data = yfinance.Ticker(ticker.upper()).history(
+            period=period, interval=interval,
+        )
+        if data.empty:
+            return {"error": f"No intraday data for {ticker}"}
+
+        return {
+            "ticker": ticker.upper(),
+            "interval": interval,
+            "bars": [
+                {
+                    "time": t.strftime("%Y-%m-%d %H:%M"),
+                    "open": round(float(row["Open"]), 2),
+                    "high": round(float(row["High"]), 2),
+                    "low": round(float(row["Low"]), 2),
+                    "close": round(float(row["Close"]), 2),
+                    "volume": int(row["Volume"]),
+                }
+                for t, row in data.iterrows()
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/stock/{ticker}/daytrading/predict")
+async def api_daytrading_predict(ticker: str):
+    """Get day trading prediction using the intraday HorizonModel."""
+    try:
+        import numpy as np
+        from ml.multi_horizon import HorizonModel, HORIZONS
+        from ml.features import compute_intraday_features
+
+        config = HORIZONS["intraday"]
+        model = HorizonModel(config)
+        model.load()
+
+        data = yfinance.Ticker(ticker.upper()).history(
+            period=config.data_period, interval=config.data_interval,
+        )
+        if data.empty:
+            return {"error": f"No intraday data for {ticker}"}
+
+        features = compute_intraday_features(data)
+        if features.empty:
+            return {"error": "Insufficient intraday data for features"}
+
+        # Use last bar
+        available = [f for f in model.feature_names if f in features.columns]
+        missing = [f for f in model.feature_names if f not in features.columns]
+        if missing:
+            # Fill missing features with 0
+            for col in missing:
+                features[col] = 0.0
+
+        X = features.iloc[[-1]][model.feature_names]
+        X_scaled = model.scaler.transform(X)
+        direction, pred_return, confidence = model.predict(X_scaled)
+
+        return {
+            "ticker": ticker.upper(),
+            "direction": "UP" if pred_return >= 0 else "DOWN",
+            "predicted_return": round(pred_return * 100, 3),
+            "confidence": round(confidence * 100, 1),
+            "horizon_bars": config.horizon,
+            "interval": config.data_interval,
+            "model_status": "ready",
+        }
+    except FileNotFoundError:
+        return {
+            "ticker": ticker.upper(),
+            "direction": "N/A",
+            "predicted_return": 0,
+            "confidence": 0,
+            "model_status": "not_trained",
+            "message": "Intraday model not trained. Use: python main.py --mode ml-horizons-train --horizon intraday",
+        }
+    except Exception as e:
+        logger.debug("Day trading prediction failed for %s: %s", ticker, e)
+        return {
+            "ticker": ticker.upper(),
+            "direction": "N/A",
+            "predicted_return": 0,
+            "confidence": 0,
+            "model_status": "error",
+            "message": str(e),
+        }
+
+
+@app.post("/api/daytrading/train")
+async def api_daytrading_train(
+    tickers: str = Query("AAPL,MSFT,NVDA,TSLA,AMD", description="Comma-separated tickers"),
+):
+    """Train the intraday day trading model (non-blocking)."""
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+
+    current = training_tracker.get("intraday")
+    if current and current["state"] == "training":
+        return {"status": "already_training"}
+
+    def _train():
+        try:
+            from ml.multi_horizon import HorizonModel, HORIZONS
+
+            config = HORIZONS["intraday"]
+            model = HorizonModel(config)
+            training_tracker.start("intraday", total_tickers=len(ticker_list))
+            logger.info("Training intraday model on %s...", ticker_list)
+
+            model.train(ticker_list)
+            model.save()
+
+            acc = model._training_stats.get("cv_accuracy", 0) if model._training_stats else 0
+            training_tracker.finish("intraday", accuracy=acc)
+            logger.info("Intraday model trained. CV=%.3f", acc)
+        except Exception as e:
+            training_tracker.fail("intraday", str(e))
+            logger.error("Intraday training failed: %s", e)
+
+    thread = threading.Thread(target=_train, daemon=True)
+    thread.start()
+    return {"status": "started", "tickers": ticker_list}
+
+
 @app.get("/api/timeframes")
 async def api_timeframes():
     """Return available timeframes for strategy backtests."""

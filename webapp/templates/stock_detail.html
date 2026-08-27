@@ -39,10 +39,37 @@
     <!-- Day Trading (hidden by default) -->
     <section class="card" id="daytrading-section" style="display:none;">
         <h2>Day Trading Model <span class="badge novel">OPT-IN</span></h2>
-        <p class="subtitle">Intraday predictions using 5-minute bars. This model is not run automatically — you enabled it for this stock.</p>
-        <div id="daytrading-panel">
-            <div class="muted">Day trading model available via CLI: <code>python main.py --mode ml-horizons-train --horizon intraday</code></div>
+
+        <!-- Day Trading Controls -->
+        <div class="dt-controls">
+            <div class="input-row" style="margin-bottom:12px;">
+                <select id="dt-interval" class="select-input">
+                    <option value="1m">1 min</option>
+                    <option value="2m">2 min</option>
+                    <option value="5m" selected>5 min</option>
+                    <option value="15m">15 min</option>
+                    <option value="30m">30 min</option>
+                    <option value="1h">1 hour</option>
+                </select>
+                <select id="dt-period" class="select-input">
+                    <option value="1d">Today</option>
+                    <option value="5d" selected>5 Days</option>
+                    <option value="1mo">1 Month</option>
+                </select>
+                <button onclick="loadDayTrading()" class="btn btn-primary">Refresh Chart</button>
+                <button onclick="getDTPrediction()" class="btn btn-outline">Get Prediction</button>
+                <button onclick="trainDTModel()" class="btn btn-outline">Train Model</button>
+            </div>
         </div>
+
+        <!-- Day Trading Prediction -->
+        <div id="dt-prediction-panel" style="margin-bottom:16px;"></div>
+
+        <!-- Candlestick Chart -->
+        <div id="dt-candlestick" style="height:450px;"></div>
+
+        <!-- Training Status -->
+        <div id="dt-training-status"></div>
     </section>
 
     <!-- Strategy Results -->
@@ -103,6 +130,128 @@ function toggleDayTrading(ticker) {
     }
     localStorage.setItem('dayTradingStocks', JSON.stringify(stocks));
     document.getElementById('daytrading-section').style.display = cb.checked ? '' : 'none';
+    if (cb.checked) loadDayTrading();
+}
+
+// ── Day Trading Chart & Prediction ──
+function loadDayTrading() {
+    const interval = document.getElementById('dt-interval').value;
+    const period = document.getElementById('dt-period').value;
+    const chart = document.getElementById('dt-candlestick');
+    chart.innerHTML = '<div class="loading">Loading intraday data...</div>';
+
+    fetch(`/api/stock/${TICKER}/intraday?interval=${interval}&period=${period}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                chart.innerHTML = `<div class="error">${data.error}</div>`;
+                return;
+            }
+            const bars = data.bars || [];
+            if (!bars.length) {
+                chart.innerHTML = '<div class="muted">No intraday data available</div>';
+                return;
+            }
+
+            const trace = {
+                x: bars.map(b => b.time),
+                open: bars.map(b => b.open),
+                high: bars.map(b => b.high),
+                low: bars.map(b => b.low),
+                close: bars.map(b => b.close),
+                type: 'candlestick',
+                increasing: { line: { color: '#16a34a' }, fillcolor: '#bbf7d0' },
+                decreasing: { line: { color: '#dc2626' }, fillcolor: '#fecaca' },
+            };
+
+            const volumeTrace = {
+                x: bars.map(b => b.time),
+                y: bars.map(b => b.volume),
+                type: 'bar',
+                marker: {
+                    color: bars.map(b => b.close >= b.open ? 'rgba(22,163,74,0.3)' : 'rgba(220,38,38,0.3)'),
+                },
+                yaxis: 'y2',
+                showlegend: false,
+            };
+
+            Plotly.newPlot(chart, [trace, volumeTrace], {
+                margin: { t: 10, r: 50, b: 40, l: 60 },
+                xaxis: { type: 'date', rangeslider: { visible: false } },
+                yaxis: { title: 'Price ($)', domain: [0.25, 1] },
+                yaxis2: { title: 'Volume', domain: [0, 0.2], showticklabels: false },
+                plot_bgcolor: '#fafafa',
+                paper_bgcolor: 'transparent',
+                font: { family: 'system-ui' },
+            }, { responsive: true });
+        })
+        .catch(() => {
+            chart.innerHTML = '<div class="error">Failed to load intraday data</div>';
+        });
+}
+
+function getDTPrediction() {
+    const panel = document.getElementById('dt-prediction-panel');
+    panel.innerHTML = '<div class="loading">Getting day trading prediction...</div>';
+
+    fetch(`/api/stock/${TICKER}/daytrading/predict`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.model_status === 'not_trained') {
+                panel.innerHTML = `
+                    <div class="status-warning">
+                        Intraday model not trained.
+                        <button onclick="trainDTModel()" class="btn btn-primary" style="margin-left:12px;">Train Now</button>
+                    </div>`;
+                return;
+            }
+            if (data.direction === 'N/A') {
+                panel.innerHTML = `<div class="muted">${data.message || 'Prediction unavailable'}</div>`;
+                return;
+            }
+            const isUp = data.direction === 'UP';
+            panel.innerHTML = `
+                <div class="prediction-card ${isUp ? 'up' : 'down'}">
+                    <div class="pred-direction">${isUp ? '&#9650;' : '&#9660;'} ${data.direction}</div>
+                    <div class="pred-return">${data.predicted_return}%</div>
+                    <div class="pred-confidence">Confidence: ${data.confidence}% | Next ${data.horizon_bars} bars (${data.interval})</div>
+                </div>`;
+        })
+        .catch(() => {
+            panel.innerHTML = '<div class="error">Failed to get prediction</div>';
+        });
+}
+
+function trainDTModel() {
+    const statusPanel = document.getElementById('dt-training-status');
+    statusPanel.innerHTML = '<div class="status-training">Training intraday model... This may take a few minutes.</div>';
+
+    fetch(`/api/daytrading/train?tickers=${TICKER},AAPL,MSFT,NVDA,TSLA`, { method: 'POST' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status === 'already_training') {
+                statusPanel.innerHTML = '<div class="status-training">Model is already training...</div>';
+            } else {
+                statusPanel.innerHTML = '<div class="status-training">Training started. Refresh in a few minutes to get predictions.</div>';
+                // Poll for completion
+                const pollInterval = setInterval(() => {
+                    fetch('/api/training/status').then(r => r.json()).then(s => {
+                        const intraday = (s.models || {})['intraday'];
+                        if (intraday && intraday.state === 'ready') {
+                            clearInterval(pollInterval);
+                            statusPanel.innerHTML = `<div class="status-ok">Model trained! Accuracy: ${(intraday.accuracy * 100).toFixed(1)}%</div>`;
+                            getDTPrediction();
+                        } else if (intraday && intraday.state === 'error') {
+                            clearInterval(pollInterval);
+                            statusPanel.innerHTML = `<div class="status-error">Training failed: ${intraday.error}</div>`;
+                        }
+                    });
+                }, 10000);
+            }
+        })
+        .catch(() => {
+            statusPanel.innerHTML = '<div class="error">Failed to start training</div>';
+        });
 }
 
 function loadStrategies() {
@@ -146,6 +295,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const dtEnabled = getDayTradingStocks().includes(TICKER);
     document.getElementById('daytrading-toggle').checked = dtEnabled;
     document.getElementById('daytrading-section').style.display = dtEnabled ? '' : 'none';
+    if (dtEnabled) {
+        loadDayTrading();
+        getDTPrediction();
+    }
 
     // Load stock data
     fetch(`/api/stock/${TICKER}`)

@@ -510,6 +510,25 @@ code {
 }
 .btn-icon:hover { background: var(--red-bg); color: var(--red); }
 
+/* ── Day Trading Inline Prediction ── */
+.dt-pred-inline { margin-bottom: 12px; }
+.dt-pred-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    border-radius: var(--radius);
+    font-size: 0.9rem;
+}
+.dt-pred-row.up { background: var(--green-bg); border: 1px solid #bbf7d0; }
+.dt-pred-row.down { background: var(--red-bg); border: 1px solid #fecaca; }
+.dt-pred-dir { font-weight: 700; font-size: 1rem; }
+.dt-pred-ret { font-weight: 600; }
+.dt-pred-conf { color: var(--text-muted); font-size: 0.85rem; }
+.dt-pred-horizon { color: var(--text-muted); font-size: 0.8rem; }
+.dt-controls { margin-bottom: 16px; }
+.btn-sm { padding: 4px 12px; font-size: 0.8rem; }
+
 /* ── Market Direction Card ── */
 .market-direction-card {
     display: flex;
