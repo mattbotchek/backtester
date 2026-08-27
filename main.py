@@ -15,6 +15,8 @@ import logging
 
 # Don't know how globals are treated in Python, or rather looked at by reviewers
 # I'm probably doing this wrong, so refactor to use... dict? Can I do a dict that points to a function? 
+# Functions to add:
+# Check single ticker against all strategies
 g_Modes = [
     "Individual Strategy",
     "Compare Strategy",
@@ -22,6 +24,10 @@ g_Modes = [
     "Check All Tickers for Strategy"
 ]
 
+# Strategies I think that would be cool to implement:
+# Non quantitative strategies (ie, not data run, but assigning non quantitative values to a stock)
+# Buy Open Sell Close <- Self explanatory
+# 200 Day Moving Average <- Buy when price is below 200 day moving average, sell when above
 g_Strategies = [
     "BuyAndHold",
     "BuyCloseSellOpen"
@@ -73,7 +79,8 @@ def checkTickerExists(ticker):
 
 # Multi ticker run work area
 
-
+# Needs a big refactor, network seems to fail part way through, or maybe hitting rate limits
+# Need to investigate. 
 def checkAllTickers():
     # Below "questions" chunk needs to be refactored into a function, but this is rough first draft
     userChoice = userChooseStrategy()
@@ -108,6 +115,7 @@ def checkAllTickers():
     print("\n\n\n\n\n\n\n")
     main()
 
+# Functionally this and checkAllTickers are the same, this just allows for a narrower scope
 def checkMultiTicker():
     # Needs refactor into function
     userChoice = userChooseStrategy()
