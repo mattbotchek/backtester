@@ -1,6 +1,7 @@
 import yfinance
 import math
 
+# What am I doing? Probably writing another interface for the yfinance interface. 
 class Strategy:
     def __init__(self, timeline, interval, ticker, cash):
         self.TIMELINE = timeline
@@ -15,6 +16,7 @@ class Strategy:
 
     # Privates
 
+    # Are these functions even worth keeping? 
     def _getClose(self, date):
         localHistory = self.HISTORY
         openPrice = localHistory.loc[date]['Open']

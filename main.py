@@ -13,6 +13,8 @@ import logging
 
 # Globals
 
+# Don't know how globals are treated in Python, or rather looked at by reviewers
+# I'm probably doing this wrong, so refactor to use... dict? Can I do a dict that points to a function? 
 g_Modes = [
     "Individual Strategy",
     "Compare Strategy",
@@ -45,6 +47,7 @@ def userChooseStrategy():
 
     return userChoice
 
+# Probably should refactor this so that it can take config file/data sheets
 def checkRunStrategy(userChoice, userTimeline, userInterval, userTicker, userCash, showOutput):
     match userChoice:
         case 0:
@@ -72,6 +75,7 @@ def checkTickerExists(ticker):
 
 
 def checkAllTickers():
+    # Below "questions" chunk needs to be refactored into a function, but this is rough first draft
     userChoice = userChooseStrategy()
 
     userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")
@@ -84,6 +88,8 @@ def checkAllTickers():
     if(showOutput == 'y'):
         verbose = True
 
+    # Can't tell if I suck, or if Python just gets messy
+    # Probably needs a refactor
     tickerFile = open("allsymbols.txt", 'r')
     outputFile = open(f"output-{userChoice}-{date.today()}-{userTimeline}-{userInterval}.csv", 'w')
     fieldNames = ["Ticker", "Final Cash Value", "ROI"]
@@ -103,6 +109,7 @@ def checkAllTickers():
     main()
 
 def checkMultiTicker():
+    # Needs refactor into function
     userChoice = userChooseStrategy()
 
     userTicker = input("Enter stock tickers (comma-separated): ")
@@ -113,11 +120,13 @@ def checkMultiTicker():
     showOutput = input("Show output? (y/n): ")
     print("\n\n\n\n\n\n\n")
     verbose = False
+
     if(showOutput == 'y'):
         verbose = True
 
     for ticker in userTicker:
         if(checkTickerExists(ticker)):
+            # What is the rule? No more than 5 parameters per function? 
             output = checkRunStrategy(userChoice, userTimeline, userInterval, ticker, userCash, verbose)
             print(f"Ticker: {ticker} \nFinal Cash Value: {output['Final Cash Value']} \nROI%: {output['ROI']}\n")
 
@@ -137,6 +146,7 @@ def compareStrategies():
 
 
 def individualStrategy():
+    # Needs refactor here too
     userChoice = userChooseStrategy()
 
     userTimeline = input("Enter timeline (Xd/Xmo/Xy/ytd): ")

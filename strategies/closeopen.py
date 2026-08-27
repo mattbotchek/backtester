@@ -3,6 +3,7 @@ import math
 from .strategy import Strategy
 
 class CloseOpen(Strategy):
+    # Need to refactor below function, neaten up, probably optimize, though the network will be the longest taking part of this I suspect. 
     def calculate(self, showOutput):
         if(showOutput):
             print("Running backtest calculation...\n\n")
@@ -36,6 +37,6 @@ class CloseOpen(Strategy):
             print(self.CASH)
 
         roi = float(((self.CASH / self.INITIAL_CASH) * 100) - 100)
-        
+
         return {"Ticker": self.TICKER, "Final Cash Value": self.CASH, "ROI": roi}
         

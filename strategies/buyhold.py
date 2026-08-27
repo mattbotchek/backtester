@@ -3,6 +3,7 @@ import math
 from .strategy import Strategy
 
 class BuyAndHold(Strategy):
+    # Refactor this as well, not complex, but could be neater. 
     def calculate(self, showOutput):
         if(showOutput):
             print("Running backtest calculation...\n\n")
