@@ -231,17 +231,15 @@ class StockPredictor:
         X = features.iloc[[-1]][self.feature_names]
         X_scaled = self.scaler.transform(X)
 
-        # Classification prediction
-        direction_code = self.classifier.predict(X_scaled)[0]
-        direction_map = {1: "UP", -1: "DOWN", 0: "DOWN"}
-        direction = direction_map.get(direction_code, "DOWN")
+        # Regression prediction (predicted magnitude)
+        predicted_return = float(self.regressor.predict(X_scaled)[0]) * 100
 
-        # Confidence from probability
+        # Classification prediction (probability-based confidence)
         proba = self.classifier.predict_proba(X_scaled)[0]
         confidence = float(max(proba))
 
-        # Regression prediction
-        predicted_return = float(self.regressor.predict(X_scaled)[0]) * 100
+        # Direction is derived from predicted return so they never contradict
+        direction = "UP" if predicted_return >= 0 else "DOWN"
 
         # Outlier detection
         outliers = self._detect_outliers(features.iloc[-1])
