@@ -100,39 +100,26 @@ def _get_stock_data(ticker: str, period: str = "1y") -> dict:
 def _run_strategies(ticker: str) -> list[dict]:
     """Run all strategies on a ticker."""
     results = []
-    strategies = list(get_registry().values())
+    registry = get_registry()
 
-    try:
-        data = yfinance.Ticker(ticker).history(period="1y")
-        if data.empty:
-            return []
-
-        for strategy_cls in strategies:
-            try:
-                strategy = strategy_cls()
-                trades = strategy.run(data)
-                if trades:
-                    total_return = sum(t.pnl_pct for t in trades)
-                    win_rate = sum(1 for t in trades if t.pnl_pct > 0) / len(trades) * 100
-                    results.append({
-                        "name": strategy.name,
-                        "is_novel": getattr(strategy, "is_novel", False),
-                        "total_return": round(total_return, 2),
-                        "win_rate": round(win_rate, 1),
-                        "num_trades": len(trades),
-                        "avg_return": round(total_return / len(trades), 2),
-                    })
-                else:
-                    results.append({
-                        "name": strategy.name,
-                        "is_novel": getattr(strategy, "is_novel", False),
-                        "total_return": 0, "win_rate": 0,
-                        "num_trades": 0, "avg_return": 0,
-                    })
-            except Exception:
-                pass
-    except Exception:
-        pass
+    for name, strategy_cls in registry.items():
+        try:
+            strategy = strategy_cls(
+                timeline="1y", interval="1d", ticker=ticker, cash=10000,
+            )
+            result = strategy.calculate()
+            results.append({
+                "name": strategy.name,
+                "is_novel": getattr(strategy, "is_novel", False),
+                "total_return": round(result.roi_percent, 2),
+                "win_rate": round(result.win_rate * 100, 1),
+                "num_trades": result.total_trades,
+                "avg_return": round(
+                    result.roi_percent / max(result.total_trades, 1), 2
+                ),
+            })
+        except Exception:
+            pass
 
     return sorted(results, key=lambda x: x["total_return"], reverse=True)
 
