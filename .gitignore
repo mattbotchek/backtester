@@ -1,3 +1,6 @@
-*.csv**/__pycache__/
+**/__pycache__/
+*.pyc
 results/
 ml/models/*.pkl
+ml/models/*.db
+_quick_check.py

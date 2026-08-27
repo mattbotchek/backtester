@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}Strategies — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="strategies-page">
+    <h1>Trading Strategies</h1>
+    <p class="subtitle">22 strategies available — 15 known (academic/industry standard) + 5 novel (custom-designed) + 2 basic</p>
+
+    <section class="card">
+        <h2>Run Strategies on a Ticker</h2>
+        <div class="input-row">
+            <input type="text" id="strat-ticker" placeholder="Enter ticker (e.g., AAPL)" value="AAPL">
+            <button onclick="runStrategies()" class="btn btn-primary">Run All Strategies</button>
+        </div>
+        <div id="strat-results">
+            <div class="muted">Enter a ticker and click Run to see strategy results</div>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Strategy Descriptions</h2>
+        <div class="strategy-list">
+            <div class="strat-group">
+                <h3>Known Strategies</h3>
+                <div class="strat-grid">
+                    <div class="strat-item"><strong>SMA Crossover</strong> — Golden/death cross (50/200 SMA)</div>
+                    <div class="strat-item"><strong>EMA Crossover</strong> — Exponential MA crossover (12/26)</div>
+                    <div class="strat-item"><strong>RSI</strong> — Relative Strength Index overbought/oversold</div>
+                    <div class="strat-item"><strong>MACD</strong> — Moving Average Convergence Divergence</div>
+                    <div class="strat-item"><strong>Bollinger Bands</strong> — Mean reversion at band boundaries</div>
+                    <div class="strat-item"><strong>Mean Reversion</strong> — Z-score based mean reversion</div>
+                    <div class="strat-item"><strong>Momentum</strong> — Price momentum factor</div>
+                    <div class="strat-item"><strong>VWAP</strong> — Volume-weighted average price</div>
+                    <div class="strat-item"><strong>Stochastic</strong> — Stochastic oscillator signals</div>
+                    <div class="strat-item"><strong>ATR Breakout</strong> — Average True Range breakout</div>
+                    <div class="strat-item"><strong>Donchian Channel</strong> — Channel breakout (20-day)</div>
+                    <div class="strat-item"><strong>Williams %R</strong> — Williams percent range</div>
+                    <div class="strat-item"><strong>OBV</strong> — On-balance volume divergence</div>
+                    <div class="strat-item"><strong>Ichimoku Cloud</strong> — Full Ichimoku system</div>
+                    <div class="strat-item"><strong>Parabolic SAR</strong> — Stop and reverse system</div>
+                </div>
+            </div>
+            <div class="strat-group">
+                <h3>Novel Strategies <span class="badge novel">CUSTOM</span></h3>
+                <div class="strat-grid">
+                    <div class="strat-item"><strong>Volatility Regime Adaptive</strong> — Adapts strategy based on current volatility regime</div>
+                    <div class="strat-item"><strong>Price Velocity Divergence</strong> — Detects when price velocity diverges from trend</div>
+                    <div class="strat-item"><strong>Volume Shock Reversal</strong> — Trades reversals after extreme volume events</div>
+                    <div class="strat-item"><strong>Range Compression</strong> — Trades breakouts from compressed trading ranges</div>
+                    <div class="strat-item"><strong>Gap Fade</strong> — Fades opening gaps expecting mean reversion</div>
+                </div>
+            </div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function runStrategies() {
+    const ticker = document.getElementById('strat-ticker').value.toUpperCase();
+    const container = document.getElementById('strat-results');
+    container.innerHTML = '<div class="loading">Running 22 strategies on ' + ticker + '...</div>';
+
+    fetch(`/api/stock/${ticker}/strategies`)
+        .then(r => r.json())
+        .then(data => {
+            const strats = data.strategies || [];
+            if (!strats.length) {
+                container.innerHTML = '<div class="error">No results for ' + ticker + '</div>';
+                return;
+            }
+            let html = `<table class="data-table">
+                <thead><tr><th>Rank</th><th>Strategy</th><th>Type</th><th>Total Return</th><th>Win Rate</th><th>Trades</th></tr></thead>
+                <tbody>`;
+            strats.forEach((s, i) => {
+                const isUp = s.total_return > 0;
+                html += `<tr>
+                    <td>${i + 1}</td>
+                    <td>${s.name}</td>
+                    <td>${s.is_novel ? '<span class="badge novel">NOVEL</span>' : '<span class="badge known">KNOWN</span>'}</td>
+                    <td class="${isUp ? 'up' : 'down'}">${s.total_return.toFixed(2)}%</td>
+                    <td>${s.win_rate.toFixed(1)}%</td>
+                    <td>${s.num_trades}</td>
+                </tr>`;
+            });
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        })
+        .catch(() => container.innerHTML = '<div class="error">Failed to run strategies</div>');
+}
+</script>
+{% endblock %}

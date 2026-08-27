@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %}{{ ticker }} — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="stock-detail">
+    <div class="stock-header" id="stock-header">
+        <h1>{{ ticker }}</h1>
+        <div class="loading">Loading stock data...</div>
+    </div>
+
+    <!-- Price Chart -->
+    <section class="card">
+        <h2>Price Chart (60 days)</h2>
+        <div id="price-chart" style="height: 400px;"></div>
+    </section>
+
+    <!-- ML Prediction -->
+    <section class="card">
+        <h2>ML Prediction</h2>
+        <div id="prediction-panel">
+            <div class="loading">Loading prediction...</div>
+        </div>
+    </section>
+
+    <!-- Strategy Results -->
+    <section class="card">
+        <h2>Strategy Analysis</h2>
+        <p class="subtitle">All 22 strategies applied to {{ ticker }} (1-year backtest)</p>
+        <div id="strategies-panel">
+            <div class="loading">Running strategies...</div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const TICKER = '{{ ticker }}';
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Load stock data
+    fetch(`/api/stock/${TICKER}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                document.getElementById('stock-header').innerHTML = `<h1>${TICKER}</h1><div class="error">${data.error}</div>`;
+                return;
+            }
+            const isUp = data.change_1d >= 0;
+            document.getElementById('stock-header').innerHTML = `
+                <div class="stock-title-row">
+                    <div>
+                        <h1>${TICKER} <span class="stock-name">${data.name || ''}</span></h1>
+                        <span class="stock-meta">${data.sector || ''} | ${data.industry || ''}</span>
+                    </div>
+                    <div class="stock-price-block">
+                        <div class="current-price">$${data.current_price.toFixed(2)}</div>
+                        <div class="price-change ${isUp ? 'up' : 'down'}">
+                            ${isUp ? '+' : ''}${data.change_1d.toFixed(2)}% today
+                        </div>
+                    </div>
+                </div>
+                <div class="stats-row">
+                    <div class="stat"><span class="label">5-Day</span><span class="${data.change_5d >= 0 ? 'up' : 'down'}">${data.change_5d.toFixed(2)}%</span></div>
+                    <div class="stat"><span class="label">20-Day</span><span class="${data.change_20d >= 0 ? 'up' : 'down'}">${data.change_20d.toFixed(2)}%</span></div>
+                    <div class="stat"><span class="label">52w High</span><span>$${data.high_52w.toFixed(2)}</span></div>
+                    <div class="stat"><span class="label">52w Low</span><span>$${data.low_52w.toFixed(2)}</span></div>
+                    <div class="stat"><span class="label">Volume</span><span>${(data.volume / 1e6).toFixed(1)}M</span></div>
+                    ${data.pe_ratio ? `<div class="stat"><span class="label">P/E</span><span>${data.pe_ratio.toFixed(1)}</span></div>` : ''}
+                </div>`;
+
+            // Plot chart
+            if (data.history) {
+                Plotly.newPlot('price-chart', [{
+                    x: data.history.dates,
+                    y: data.history.close,
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Close',
+                    line: { color: '#2563eb', width: 2 },
+                    fill: 'tozeroy',
+                    fillcolor: 'rgba(37,99,235,0.08)',
+                }], {
+                    margin: { t: 10, r: 30, b: 40, l: 60 },
+                    xaxis: { type: 'date' },
+                    yaxis: { title: 'Price ($)' },
+                    plot_bgcolor: '#fafafa',
+                    paper_bgcolor: 'transparent',
+                    font: { family: 'system-ui' },
+                }, { responsive: true });
+            }
+        });
+
+    // Load prediction
+    fetch(`/api/stock/${TICKER}/prediction`)
+        .then(r => r.json())
+        .then(data => {
+            const p = data.prediction || {};
+            const panel = document.getElementById('prediction-panel');
+            const dir = p.direction || 'N/A';
+            const arrow = dir === 'UP' ? '&#9650;' : dir === 'DOWN' ? '&#9660;' : '&#9654;';
+            const color = dir === 'UP' ? 'up' : dir === 'DOWN' ? 'down' : '';
+            panel.innerHTML = `
+                <div class="prediction-card ${color}">
+                    <div class="pred-direction">${arrow} ${dir}</div>
+                    <div class="pred-return">${p.predicted_return || 0}%</div>
+                    <div class="pred-confidence">Confidence: ${p.confidence || 0}%</div>
+                    ${p.outliers && p.outliers.length ? `<div class="pred-outliers">Outliers: ${p.outliers.join(', ')}</div>` : ''}
+                </div>`;
+        })
+        .catch(() => {
+            document.getElementById('prediction-panel').innerHTML = '<div class="muted">Model not trained. Run: python main.py --mode ml-train</div>';
+        });
+
+    // Load strategies
+    fetch(`/api/stock/${TICKER}/strategies`)
+        .then(r => r.json())
+        .then(data => {
+            const panel = document.getElementById('strategies-panel');
+            const strats = data.strategies || [];
+            if (!strats.length) {
+                panel.innerHTML = '<div class="muted">No strategy results</div>';
+                return;
+            }
+            let html = `<table class="data-table">
+                <thead><tr><th>Strategy</th><th>Type</th><th>Total Return</th><th>Win Rate</th><th>Trades</th><th>Avg Return</th></tr></thead>
+                <tbody>`;
+            for (const s of strats) {
+                const isUp = s.total_return > 0;
+                html += `<tr>
+                    <td>${s.name}</td>
+                    <td>${s.is_novel ? '<span class="badge novel">NOVEL</span>' : '<span class="badge known">KNOWN</span>'}</td>
+                    <td class="${isUp ? 'up' : 'down'}">${s.total_return.toFixed(2)}%</td>
+                    <td>${s.win_rate.toFixed(1)}%</td>
+                    <td>${s.num_trades}</td>
+                    <td class="${s.avg_return > 0 ? 'up' : 'down'}">${s.avg_return.toFixed(2)}%</td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            panel.innerHTML = html;
+        })
+        .catch(() => {
+            document.getElementById('strategies-panel').innerHTML = '<div class="error">Failed to load strategies</div>';
+        });
+});
+</script>
+{% endblock %}

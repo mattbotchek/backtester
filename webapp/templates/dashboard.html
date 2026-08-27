@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+    <h1>Market Dashboard</h1>
+
+    <!-- Market Overview -->
+    <section class="card market-overview">
+        <h2>Market Overview</h2>
+        <div id="indices-grid" class="indices-grid">
+            <div class="loading">Loading market data...</div>
+        </div>
+    </section>
+
+    <!-- Sentiment -->
+    <section class="card">
+        <h2>Market Sentiment</h2>
+        <div id="sentiment-panel" class="sentiment-panel">
+            <div class="loading">Loading sentiment...</div>
+        </div>
+    </section>
+
+    <!-- Daily Predictions -->
+    <section class="card">
+        <h2>Today's Predictions</h2>
+        <p class="subtitle">ML model predictions for S&amp;P 500 stocks (updated after market close)</p>
+        <div id="predictions-table-container">
+            <div class="loading">Loading predictions...</div>
+        </div>
+    </section>
+
+    <!-- Top Movers -->
+    <section class="card">
+        <h2>Quick Lookup</h2>
+        <div class="ticker-grid" id="ticker-grid">
+            {% for sector, tickers in [
+                ("Tech", ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA"]),
+                ("Finance", ["JPM", "GS", "BAC", "V", "MA", "BRK-B"]),
+                ("Healthcare", ["JNJ", "UNH", "LLY", "PFE", "ABBV", "TMO"]),
+                ("Energy", ["XOM", "CVX", "COP", "EOG", "SLB"]),
+                ("Consumer", ["WMT", "COST", "HD", "NKE", "SBUX", "DIS"]),
+                ("Industrial", ["BA", "CAT", "DE", "GE", "HON", "UPS"]),
+            ] %}
+            <div class="sector-group">
+                <h3>{{ sector }}</h3>
+                <div class="ticker-chips">
+                    {% for t in tickers %}
+                    <a href="/stock/{{ t }}" class="ticker-chip">{{ t }}</a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    // Load market overview
+    fetch('/api/market/overview')
+        .then(r => r.json())
+        .then(data => {
+            const grid = document.getElementById('indices-grid');
+            grid.innerHTML = '';
+            for (const [name, info] of Object.entries(data.indices || {})) {
+                const isUp = info.change >= 0;
+                grid.innerHTML += `
+                    <div class="index-card ${isUp ? 'up' : 'down'}">
+                        <div class="index-name">${name}</div>
+                        <div class="index-price">${info.price.toLocaleString()}</div>
+                        <div class="index-change">${isUp ? '+' : ''}${info.change.toFixed(2)}%</div>
+                    </div>`;
+            }
+        })
+        .catch(() => {
+            document.getElementById('indices-grid').innerHTML = '<div class="error">Failed to load market data</div>';
+        });
+
+    // Load sentiment
+    fetch('/api/sentiment')
+        .then(r => r.json())
+        .then(data => {
+            const panel = document.getElementById('sentiment-panel');
+            if (data.error) {
+                panel.innerHTML = `<div class="error">${data.error}</div>`;
+                return;
+            }
+            const s = data.sentiment || {};
+            const fg = s.fear_greed_index || 50;
+            const fgLabel = fg > 75 ? 'Extreme Greed' : fg > 55 ? 'Greed' : fg > 45 ? 'Neutral' : fg > 25 ? 'Fear' : 'Extreme Fear';
+            panel.innerHTML = `
+                <div class="sentiment-grid">
+                    <div class="sentiment-item">
+                        <span class="label">Fear/Greed</span>
+                        <span class="value ${fg > 50 ? 'up' : 'down'}">${fg.toFixed(0)} (${fgLabel})</span>
+                    </div>
+                    <div class="sentiment-item">
+                        <span class="label">News Sentiment</span>
+                        <span class="value ${s.news_sentiment_avg > 0 ? 'up' : 'down'}">${(s.news_sentiment_avg || 0).toFixed(3)}</span>
+                    </div>
+                    <div class="sentiment-item">
+                        <span class="label">Conflict Score</span>
+                        <span class="value">${(s.news_conflict_score || 0).toFixed(3)}</span>
+                    </div>
+                    <div class="sentiment-item">
+                        <span class="label">Articles Analyzed</span>
+                        <span class="value">${s.news_article_count || 0}</span>
+                    </div>
+                </div>`;
+        })
+        .catch(() => {
+            document.getElementById('sentiment-panel').innerHTML = '<div class="muted">Sentiment data unavailable</div>';
+        });
+
+    // Load predictions
+    fetch('/api/predictions/daily')
+        .then(r => r.json())
+        .then(data => {
+            const container = document.getElementById('predictions-table-container');
+            const preds = data.predictions || {};
+            if (Object.keys(preds).length === 0) {
+                container.innerHTML = '<div class="muted">No predictions available. Train the model first.</div>';
+                return;
+            }
+            let html = `<table class="data-table">
+                <thead><tr><th>Ticker</th><th>Direction</th><th>Predicted Return</th><th>Confidence</th></tr></thead>
+                <tbody>`;
+            for (const [ticker, pred] of Object.entries(preds)) {
+                const dir = pred.direction || 'N/A';
+                const isUp = dir === 'UP';
+                html += `<tr>
+                    <td><a href="/stock/${ticker}">${ticker}</a></td>
+                    <td class="${isUp ? 'up' : dir === 'DOWN' ? 'down' : ''}">${dir}</td>
+                    <td>${pred.predicted_return || 0}%</td>
+                    <td>${pred.confidence || 0}%</td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        })
+        .catch(() => {
+            document.getElementById('predictions-table-container').innerHTML = '<div class="muted">Predictions unavailable</div>';
+        });
+});
+</script>
+{% endblock %}

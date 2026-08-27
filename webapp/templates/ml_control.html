@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}ML Models — Stock Predictor{% endblock %}
+
+{% block content %}
+<div class="ml-page">
+    <h1>ML Model Controls</h1>
+
+    <section class="card">
+        <h2>Model Status</h2>
+        <div id="model-status">
+            <div class="loading">Checking model status...</div>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Available Models</h2>
+        <table class="data-table">
+            <thead><tr><th>Model</th><th>Horizon</th><th>Description</th><th>CLI Command</th></tr></thead>
+            <tbody>
+                <tr><td>Default</td><td>10 days</td><td>Binary UP/DOWN with ensemble</td><td><code>python main.py --mode ml-train</code></td></tr>
+                <tr><td>Short 1D</td><td>1 day</td><td>Next-day prediction</td><td><code>python main.py --mode ml-horizons-train --horizon short_1d</code></td></tr>
+                <tr><td>Short 5D</td><td>5 days</td><td>Weekly swing trades</td><td><code>python main.py --mode ml-horizons-train --horizon short_5d</code></td></tr>
+                <tr><td>Medium 20D</td><td>20 days</td><td>Monthly positions</td><td><code>python main.py --mode ml-horizons-train --horizon medium_20d</code></td></tr>
+                <tr><td>Long 60D</td><td>60 days</td><td>Quarterly positions</td><td><code>python main.py --mode ml-horizons-train --horizon long_60d</code></td></tr>
+                <tr><td>Long 252D</td><td>252 days</td><td>Annual investment</td><td><code>python main.py --mode ml-horizons-train --horizon long_252d</code></td></tr>
+                <tr><td>Combined</td><td>5 days</td><td>Quant + Sentiment model</td><td><code>python -m ml.sentiment.combined_model</code></td></tr>
+                <tr><td>Intraday</td><td>30 bars</td><td>Day trading (5-min bars)</td><td><code>python main.py --mode ml-horizons-train --horizon intraday</code></td></tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="card">
+        <h2>Accuracy Results</h2>
+        <h3>Walk-Forward Backtest (Temporal — Honest Results)</h3>
+        <table class="data-table">
+            <thead><tr><th>Horizon</th><th>Overall</th><th>High Confidence (&gt;75%)</th><th>Method</th></tr></thead>
+            <tbody>
+                <tr><td>1 day</td><td>50.3%</td><td>56.6% (2% of preds)</td><td>Rolling retrain</td></tr>
+                <tr><td>5 days</td><td>50.8%</td><td>57.8% (8% of preds)</td><td>Rolling retrain</td></tr>
+                <tr><td>20 days</td><td>52.0%</td><td>52.3% (17% of preds)</td><td>Rolling retrain</td></tr>
+                <tr><td>60 days</td><td>52.8%</td><td>53.9% (31% of preds)</td><td>Rolling retrain</td></tr>
+            </tbody>
+        </table>
+
+        <h3>Cross-Sectional Holdout</h3>
+        <table class="data-table">
+            <thead><tr><th>Horizon</th><th>Accuracy</th><th>Method</th></tr></thead>
+            <tbody>
+                <tr><td>1 day</td><td>67.3%</td><td>Unseen tickers, same period</td></tr>
+                <tr><td>5 days</td><td>66.6%</td><td>Unseen tickers, same period</td></tr>
+                <tr><td>20 days</td><td>65.6%</td><td>Unseen tickers, same period</td></tr>
+                <tr><td>60 days</td><td>66.4%</td><td>Unseen tickers, same period</td></tr>
+            </tbody>
+        </table>
+    </section>
+
+    <section class="card">
+        <h2>Training Commands</h2>
+        <div class="command-list">
+            <div class="command-item">
+                <h4>Train Default Model</h4>
+                <code>python main.py --mode ml-train</code>
+            </div>
+            <div class="command-item">
+                <h4>Train All Horizon Models</h4>
+                <code>python main.py --mode ml-horizons-train</code>
+            </div>
+            <div class="command-item">
+                <h4>Run Walk-Forward Backtest</h4>
+                <code>python main.py --mode ml-backtest</code>
+            </div>
+            <div class="command-item">
+                <h4>Run Accuracy Optimization Loop</h4>
+                <code>python -m ml.optimize_loop --horizon 5 --target 0.65 --rounds 3</code>
+            </div>
+            <div class="command-item">
+                <h4>Run 24/7 Headless Prediction</h4>
+                <code>python main.py --mode ml-headless --interval 3600 --output predictions.csv</code>
+            </div>
+            <div class="command-item">
+                <h4>Start Web Server (24/7)</h4>
+                <code>python -m webapp.app</code>
+            </div>
+        </div>
+    </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const panel = document.getElementById('model-status');
+    // Check for saved models
+    fetch('/api/stock/AAPL/prediction')
+        .then(r => r.json())
+        .then(data => {
+            const p = data.prediction || {};
+            if (p.direction === 'N/A') {
+                panel.innerHTML = `<div class="status-warning">No trained model found. Run: <code>python main.py --mode ml-train</code></div>`;
+            } else {
+                panel.innerHTML = `<div class="status-ok">Model loaded. Test prediction for AAPL: ${p.direction} (${p.confidence}% confidence)</div>`;
+            }
+        })
+        .catch(() => {
+            panel.innerHTML = `<div class="status-warning">Model not available. Train it first.</div>`;
+        });
+});
+</script>
+{% endblock %}

@@ -2,3 +2,12 @@ yfinance
 pandas
 numpy
 scikit-learn
+vaderSentiment
+feedparser
+beautifulsoup4
+requests
+fastapi
+uvicorn[standard]
+jinja2
+aiofiles
+plotly
