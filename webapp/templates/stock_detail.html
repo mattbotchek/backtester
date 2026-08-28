@@ -166,16 +166,20 @@ function renderPriceChart() {
         }
     }
 
-    Plotly.newPlot('price-chart', traces, {
-        margin: { t: 10, r: 30, b: 40, l: 60 },
-        xaxis: { type: 'date' },
-        yaxis: { title: 'Price ($)' },
-        plot_bgcolor: '#fafafa',
-        paper_bgcolor: 'transparent',
-        font: { family: 'system-ui' },
-        legend: { orientation: 'h', y: -0.2 },
-        hovermode: 'x unified',
-    }, { responsive: true });
+    loadPlotly().then(() => Plotly.newPlot('price-chart', traces, {
+            margin: { t: 10, r: 30, b: 40, l: 60 },
+            xaxis: { type: 'date' },
+            yaxis: { title: 'Price ($)' },
+            plot_bgcolor: '#fafafa',
+            paper_bgcolor: 'transparent',
+            font: { family: 'system-ui' },
+            legend: { orientation: 'h', y: -0.2 },
+            hovermode: 'x unified',
+        }, { responsive: true }))
+        .catch(() => {
+            document.getElementById('price-chart').innerHTML =
+                '<div class="muted">Chart library unavailable</div>';
+        });
 }
 
 function renderPredictionHistory(history) {
@@ -338,15 +342,15 @@ function loadDayTrading() {
                 }
             }
 
-            Plotly.newPlot(chart, traces, {
-                margin: { t: 10, r: 50, b: 40, l: 60 },
-                xaxis: { type: 'date', rangeslider: { visible: false } },
-                yaxis: { title: 'Price ($)', domain: [0.25, 1] },
-                yaxis2: { title: 'Volume', domain: [0, 0.2], showticklabels: false },
-                plot_bgcolor: '#fafafa',
-                paper_bgcolor: 'transparent',
-                font: { family: 'system-ui' },
-            }, { responsive: true });
+            return loadPlotly().then(() => Plotly.newPlot(chart, traces, {
+                    margin: { t: 10, r: 50, b: 40, l: 60 },
+                    xaxis: { type: 'date', rangeslider: { visible: false } },
+                    yaxis: { title: 'Price ($)', domain: [0.25, 1] },
+                    yaxis2: { title: 'Volume', domain: [0, 0.2], showticklabels: false },
+                    plot_bgcolor: '#fafafa',
+                    paper_bgcolor: 'transparent',
+                    font: { family: 'system-ui' },
+                }, { responsive: true }));
         })
         .catch(() => {
             chart.innerHTML = '<div class="error">Failed to load intraday data</div>';

@@ -5,5 +5,6 @@ ml/models/*.pkl
 ml/models/*.db
 ml/models/*.db-*
 ml/models/continuous_training_state.json
+ml/models/web_response_cache.json
 _quick_check.py
 ml/__pycache__/

@@ -96,6 +96,26 @@ class PredictionStoreTests(unittest.TestCase):
         self.assertEqual(["AAPL"], [item["ticker"] for item in aapl])
         self.assertEqual(["MSFT"], [item["ticker"] for item in default])
 
+    def test_latest_predictions_returns_one_row_per_ticker_and_model(self):
+        old = self.record()
+        newest = self.record(
+            input_at=self.input_at + timedelta(minutes=1),
+            target_at=self.target_at + timedelta(days=1),
+            confidence=0.9,
+        )
+        other_model = self.record(
+            model_name="stock_predictor",
+            family="StockPredictor",
+        )
+
+        latest = self.store.latest_predictions(tickers=["aapl"])
+
+        self.assertEqual(
+            {newest["id"], other_model["id"]},
+            {item["id"] for item in latest},
+        )
+        self.assertNotIn(old["id"], {item["id"] for item in latest})
+
     def test_business_day_target_and_direction_rules(self):
         friday = datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
         target = prediction_target_time(friday, 1, "1d")

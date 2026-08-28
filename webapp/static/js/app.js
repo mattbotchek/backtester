@@ -1,5 +1,22 @@
 /* Stock Predictor — Client-side JavaScript */
 
+let plotlyLoadPromise = null;
+
+function loadPlotly() {
+    if (window.Plotly) return Promise.resolve(window.Plotly);
+    if (!plotlyLoadPromise) {
+        plotlyLoadPromise = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.plot.ly/plotly-2.27.0.min.js';
+            script.async = true;
+            script.onload = () => resolve(window.Plotly);
+            script.onerror = () => reject(new Error('Unable to load chart library'));
+            document.head.appendChild(script);
+        });
+    }
+    return plotlyLoadPromise;
+}
+
 // Ticker search functionality
 document.addEventListener('DOMContentLoaded', () => {
     const searchInput = document.getElementById('ticker-search');

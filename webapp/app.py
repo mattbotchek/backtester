@@ -12,11 +12,13 @@ FastAPI-based web server providing:
 Run with: python -m webapp.app
 """
 
+import asyncio
 import logging
 import os
 import sys
 import threading
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -24,6 +26,7 @@ from typing import Optional
 
 import yfinance
 from fastapi import FastAPI, Request, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -33,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategies import get_registry
 from ml.prediction_store import PredictionStore, iso_utc, utc_now
+from webapp.cache import PersistentTTLCache
 
 logger = logging.getLogger(__name__)
 
@@ -150,52 +154,96 @@ class TrainingTracker:
 
 training_tracker = TrainingTracker()
 
-# Cache for predictions
-_prediction_cache: dict = {}
-_cache_timestamp: Optional[datetime] = None
 _settlement_lock = threading.Lock()
 _last_settlement_at: Optional[datetime] = None
 _settlement_in_progress = False
+_web_cache = PersistentTTLCache()
+_prediction_refresh_lock = threading.Lock()
+_prediction_refreshes: set[str] = set()
+_prediction_refresh_slots = threading.Semaphore(2)
+
+
+@app.middleware("http")
+async def add_request_timing(request: Request, call_next):
+    """Expose server duration and flag handlers that violate the page budget."""
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.headers["Server-Timing"] = f"app;dur={elapsed_ms:.1f}"
+    if elapsed_ms >= 5000:
+        logger.warning(
+            "Slow request %s %s completed in %.2fs",
+            request.method,
+            request.url.path,
+            elapsed_ms / 1000,
+        )
+    return response
 
 
 # ── Helper functions ──
 
-def _get_stock_data(ticker: str, period: str = "1y") -> dict:
-    """Get stock data from yfinance."""
-    try:
-        stock = yfinance.Ticker(ticker)
-        hist = stock.history(period=period)
-        info = stock.info if hasattr(stock, "info") else {}
+def _get_stock_history(ticker: str, period: str = "1y") -> dict:
+    """Get price history and quote statistics from yfinance."""
+    hist = yfinance.Ticker(ticker).history(period=period)
 
-        if hist.empty:
-            return {"error": f"No data for {ticker}"}
+    if hist.empty:
+        raise ValueError(f"No data for {ticker}")
 
-        return {
-            "ticker": ticker,
-            "name": info.get("longName", info.get("shortName", ticker)),
-            "sector": info.get("sector", "Unknown"),
-            "industry": info.get("industry", "Unknown"),
-            "market_cap": info.get("marketCap", 0),
-            "pe_ratio": info.get("trailingPE", None),
-            "current_price": float(hist["Close"].iloc[-1]),
-            "change_1d": float(hist["Close"].pct_change().iloc[-1] * 100),
-            "change_5d": float(
-                hist["Close"].pct_change(5).iloc[-1] * 100
-            ) if len(hist) > 5 else 0,
-            "change_20d": float(
-                hist["Close"].pct_change(20).iloc[-1] * 100
-            ) if len(hist) > 20 else 0,
-            "volume": int(hist["Volume"].iloc[-1]),
-            "high_52w": float(hist["Close"].max()),
-            "low_52w": float(hist["Close"].min()),
-            "history": {
-                "dates": [d.strftime("%Y-%m-%d") for d in hist.index[-60:]],
-                "close": [round(float(v), 2) for v in hist["Close"].iloc[-60:]],
-                "volume": [int(v) for v in hist["Volume"].iloc[-60:]],
-            },
-        }
-    except Exception as e:
-        return {"error": str(e), "ticker": ticker}
+    return {
+        "ticker": ticker,
+        "current_price": float(hist["Close"].iloc[-1]),
+        "change_1d": float(hist["Close"].pct_change().iloc[-1] * 100),
+        "change_5d": float(
+            hist["Close"].pct_change(5).iloc[-1] * 100
+        ) if len(hist) > 5 else 0,
+        "change_20d": float(
+            hist["Close"].pct_change(20).iloc[-1] * 100
+        ) if len(hist) > 20 else 0,
+        "volume": int(hist["Volume"].iloc[-1]),
+        "high_52w": float(hist["Close"].max()),
+        "low_52w": float(hist["Close"].min()),
+        "history": {
+            "dates": [d.strftime("%Y-%m-%d") for d in hist.index[-60:]],
+            "close": [round(float(v), 2) for v in hist["Close"].iloc[-60:]],
+            "volume": [int(v) for v in hist["Volume"].iloc[-60:]],
+        },
+    }
+
+
+def _get_stock_metadata(ticker: str) -> dict:
+    """Get slowly changing company metadata independently of live quotes."""
+    info = yfinance.Ticker(ticker).info
+    if not info:
+        raise ValueError(f"No metadata for {ticker}")
+    return {
+        "name": info.get("longName", info.get("shortName", ticker)),
+        "sector": info.get("sector", "Unknown"),
+        "industry": info.get("industry", "Unknown"),
+        "market_cap": info.get("marketCap", 0),
+        "pe_ratio": info.get("trailingPE"),
+    }
+
+
+def _cached_payload(
+    key: str,
+    loader,
+    *,
+    ttl_seconds: float,
+    fallback: dict,
+    wait_seconds: float = 3.5,
+) -> dict:
+    """Load JSON-ready data without allowing remote sources to stall a page."""
+    value, state = _web_cache.get(
+        key,
+        loader,
+        ttl_seconds=ttl_seconds,
+        wait_seconds=wait_seconds,
+        fallback=fallback,
+    )
+    payload = deepcopy(value)
+    if isinstance(payload, dict):
+        payload["cache_state"] = state
+    return payload
 
 
 def _run_strategies(ticker: str, timeline: str = "ytd") -> list[dict]:
@@ -271,6 +319,12 @@ def _settle_due_predictions(force: bool = False) -> dict:
     """Throttle market lookups while keeping realized outcomes current."""
     global _last_settlement_at, _settlement_in_progress
 
+    if (
+        not force
+        and os.environ.get("WEBAPP_CONTINUOUS_PIPELINE", "0") == "1"
+    ):
+        return {"status": "coordinated_pipeline"}
+
     with _settlement_lock:
         now = utc_now()
         if _settlement_in_progress:
@@ -326,6 +380,95 @@ def _normalize_model_prediction(prediction: dict) -> dict:
         if normalized.get(field) is not None:
             normalized[field] = round(float(normalized[field]), 4)
     return normalized
+
+
+def _stored_prediction(
+    prediction: dict,
+    model_statistics: dict[str, dict],
+) -> dict:
+    """Normalize a durable ledger prediction to the public API shape."""
+    model = model_statistics.get(prediction["model_name"], {})
+    metadata = prediction.get("metadata") or {}
+    forward_accuracy = model.get("forward_accuracy")
+    return {
+        "model_name": prediction["model_name"],
+        "ticker": prediction["ticker"],
+        "direction": prediction["direction"],
+        "predicted_return": round(
+            float(prediction["predicted_return_pct"]),
+            3,
+        ),
+        "confidence": round(float(prediction["confidence"]) * 100, 1),
+        "outliers": metadata.get("outliers", []),
+        "created_at": prediction["created_at"],
+        "input_at": prediction["input_at"],
+        "target_at": prediction["target_at"],
+        "base_price": round(float(prediction["base_price"]), 4),
+        "predicted_price": round(float(prediction["predicted_price"]), 4),
+        "last_trained_at": model.get(
+            "last_trained_at",
+            prediction["model_trained_at"],
+        ),
+        "forward_accuracy": (
+            round(float(forward_accuracy) * 100, 1)
+            if forward_accuracy is not None
+            else None
+        ),
+        "settled_predictions": int(model.get("settled_count", 0)),
+        "interval": prediction["interval"],
+        "horizon": int(prediction["horizon"]),
+        "status": prediction["status"],
+        "actual_price": prediction.get("actual_price"),
+        "actual_at": prediction.get("actual_at"),
+        "hit": prediction.get("hit"),
+    }
+
+
+def _stored_predictions(
+    tickers: list[str],
+    *,
+    model_name: str | None = None,
+) -> list[dict]:
+    store = PredictionStore()
+    statistics = {
+        item["model_name"]: item
+        for item in store.model_statistics()
+    }
+    return [
+        _stored_prediction(item, statistics)
+        for item in store.latest_predictions(
+            tickers=tickers,
+            model_name=model_name,
+        )
+    ]
+
+
+def _schedule_prediction_refresh(ticker: str) -> bool:
+    """Generate missing on-demand predictions without blocking a web request."""
+    normalized = ticker.upper()
+    with _prediction_refresh_lock:
+        if normalized in _prediction_refreshes:
+            return True
+        if len(_prediction_refreshes) >= 20:
+            return False
+        _prediction_refreshes.add(normalized)
+
+    def refresh() -> None:
+        try:
+            with _prediction_refresh_slots:
+                _get_all_ml_predictions(normalized)
+        except Exception:
+            logger.exception("On-demand prediction refresh failed for %s", normalized)
+        finally:
+            with _prediction_refresh_lock:
+                _prediction_refreshes.discard(normalized)
+
+    threading.Thread(
+        target=refresh,
+        name=f"prediction-refresh-{normalized}",
+        daemon=True,
+    ).start()
+    return True
 
 
 def _get_all_ml_predictions(ticker: str) -> tuple[list[dict], list[dict]]:
@@ -463,28 +606,71 @@ async def api_tickers(q: str = Query("", description="Search query")):
 @app.get("/api/popular")
 async def api_popular():
     """Get the 20 most popular tickers with quick stats."""
-    results = []
-    for ticker in POPULAR_TICKERS:
-        try:
-            hist = yfinance.Ticker(ticker).history(period="5d")
-            if hist.empty:
-                continue
-            price = float(hist["Close"].iloc[-1])
-            change = float(hist["Close"].pct_change().iloc[-1] * 100)
-            results.append({
-                "ticker": ticker,
-                "price": round(price, 2),
-                "change": round(change, 2),
-            })
-        except Exception:
-            pass
-    return {"popular": results}
+    def load() -> dict:
+        results = []
+        for ticker in POPULAR_TICKERS:
+            try:
+                hist = yfinance.Ticker(ticker).history(period="5d")
+                if hist.empty:
+                    continue
+                price = float(hist["Close"].iloc[-1])
+                change = float(hist["Close"].pct_change().iloc[-1] * 100)
+                results.append({
+                    "ticker": ticker,
+                    "price": round(price, 2),
+                    "change": round(change, 2),
+                })
+            except Exception:
+                logger.debug("Popular quote unavailable for %s", ticker)
+        return {"popular": results}
+
+    return await run_in_threadpool(
+        _cached_payload,
+        "popular",
+        load,
+        ttl_seconds=300,
+        fallback={"popular": []},
+    )
 
 
 @app.get("/api/stock/{ticker}")
 async def api_stock(ticker: str):
     """Get stock data and quick stats."""
-    return JSONResponse(_get_stock_data(ticker.upper()))
+    normalized = ticker.upper()
+    history_call = run_in_threadpool(
+        _cached_payload,
+        f"stock-history:{normalized}:1y",
+        lambda: _get_stock_history(normalized),
+        ttl_seconds=300,
+        fallback={"ticker": normalized, "error": "Market data is refreshing"},
+    )
+    metadata_call = run_in_threadpool(
+        _cached_payload,
+        f"stock-metadata:{normalized}",
+        lambda: _get_stock_metadata(normalized),
+        ttl_seconds=86400,
+        wait_seconds=0.1,
+        fallback={
+            "name": normalized,
+            "sector": "Unknown",
+            "industry": "Unknown",
+            "market_cap": 0,
+            "pe_ratio": None,
+        },
+    )
+    history, metadata = await asyncio.gather(history_call, metadata_call)
+    states = {history.pop("cache_state"), metadata.pop("cache_state")}
+    payload = {**metadata, **history}
+    payload["cache_state"] = (
+        "refreshing"
+        if states & {"refreshing", "error"}
+        else "stale"
+        if "stale" in states
+        else "fresh"
+        if states == {"fresh"}
+        else "loaded"
+    )
+    return JSONResponse(payload)
 
 
 @app.get("/api/stock/{ticker}/strategies")
@@ -493,28 +679,71 @@ async def api_strategies(
     timeline: str = Query(DEFAULT_TIMEFRAME, description="Backtest timeframe"),
 ):
     """Run all strategies on a stock with a given timeframe."""
-    results = _run_strategies(ticker.upper(), timeline)
-    return {"ticker": ticker.upper(), "timeline": timeline, "strategies": results}
+    normalized = ticker.upper()
+    payload = await run_in_threadpool(
+        _cached_payload,
+        f"strategies:{normalized}:{timeline}",
+        lambda: {
+            "ticker": normalized,
+            "timeline": timeline,
+            "strategies": _run_strategies(normalized, timeline),
+        },
+        ttl_seconds=900,
+        fallback={
+            "ticker": normalized,
+            "timeline": timeline,
+            "strategies": [],
+        },
+    )
+    results = payload["strategies"]
+    return {
+        "ticker": normalized,
+        "timeline": timeline,
+        "strategies": results,
+        "cache_state": payload["cache_state"],
+    }
 
 
 @app.get("/api/stock/{ticker}/prediction")
 async def api_prediction(ticker: str):
     """Get the default ML prediction for a stock."""
-    pred = _get_ml_prediction(ticker.upper())
-    return {"ticker": ticker.upper(), "prediction": pred}
+    normalized = ticker.upper()
+    predictions = _stored_predictions(
+        [normalized],
+        model_name="stock_predictor",
+    )
+    refreshing = not predictions and _schedule_prediction_refresh(normalized)
+    pred = predictions[0] if predictions else {
+        "direction": "N/A",
+        "predicted_return": 0,
+        "confidence": 0,
+        "model_status": "refreshing" if refreshing else "not_available",
+    }
+    return {
+        "ticker": normalized,
+        "prediction": pred,
+        "refreshing": refreshing,
+    }
 
 
 @app.get("/api/stock/{ticker}/predictions")
 async def api_all_predictions(ticker: str):
     """Get current predictions and realized history from every trained model."""
     normalized_ticker = ticker.upper()
-    predictions, errors = _get_all_ml_predictions(normalized_ticker)
-    history = PredictionStore().get_history(ticker=normalized_ticker, limit=500)
+    store = PredictionStore()
+    predictions = _stored_predictions([normalized_ticker])
+    registered_models = store.model_statistics()
+    refreshing = (
+        len(predictions) < len(registered_models)
+        and _schedule_prediction_refresh(normalized_ticker)
+    )
+    history = store.get_history(ticker=normalized_ticker, limit=500)
     return {
         "ticker": normalized_ticker,
         "predictions": predictions,
         "history": history,
-        "errors": errors,
+        "errors": [],
+        "refreshing": refreshing,
     }
 
 
@@ -551,36 +780,44 @@ async def api_model_status():
 @app.get("/api/market/overview")
 async def api_market_overview():
     """Get market overview (major indices + top movers)."""
-    indices = {}
-    for symbol, name in [
-        ("SPY", "S&P 500"),
-        ("QQQ", "Nasdaq 100"),
-        ("IWM", "Russell 2000"),
-        ("DIA", "Dow Jones"),
-        ("^VIX", "VIX"),
-    ]:
-        try:
-            data = yfinance.Ticker(symbol).history(period="5d")
-            if not data.empty and len(data) >= 2:
-                indices[name] = {
-                    "price": round(float(data["Close"].iloc[-1]), 2),
-                    "change": round(
-                        float(data["Close"].pct_change().iloc[-1] * 100), 2
-                    ),
-                }
-        except Exception:
-            pass
-    return {"indices": indices}
+    def load() -> dict:
+        indices = {}
+        for symbol, name in [
+            ("SPY", "S&P 500"),
+            ("QQQ", "Nasdaq 100"),
+            ("IWM", "Russell 2000"),
+            ("DIA", "Dow Jones"),
+            ("^VIX", "VIX"),
+        ]:
+            try:
+                data = yfinance.Ticker(symbol).history(period="5d")
+                if not data.empty and len(data) >= 2:
+                    indices[name] = {
+                        "price": round(float(data["Close"].iloc[-1]), 2),
+                        "change": round(
+                            float(data["Close"].pct_change().iloc[-1] * 100), 2
+                        ),
+                    }
+            except Exception:
+                logger.debug("Market overview quote unavailable for %s", symbol)
+        return {"indices": indices}
+
+    return await run_in_threadpool(
+        _cached_payload,
+        "market-overview",
+        load,
+        ttl_seconds=60,
+        fallback={"indices": {}},
+    )
 
 
 @app.get("/api/market/predictions")
 async def api_market_predictions():
     """Get market-wide predictions: overall direction and top movers."""
-    predictions = []
-    for ticker in POPULAR_TICKERS:
-        pred = _get_ml_prediction(ticker)
-        if pred["direction"] != "N/A":
-            predictions.append({"ticker": ticker, **pred})
+    predictions = _stored_predictions(
+        POPULAR_TICKERS,
+        model_name="stock_predictor",
+    )
 
     # Sort by absolute predicted return for "highest movers"
     predictions.sort(key=lambda x: abs(x["predicted_return"]), reverse=True)
@@ -615,22 +852,12 @@ async def api_market_predictions():
 @app.get("/api/predictions/daily")
 async def api_daily_predictions():
     """Get daily predictions for popular stocks."""
-    global _prediction_cache, _cache_timestamp
-
-    if (
-        _cache_timestamp
-        and (datetime.now() - _cache_timestamp) < timedelta(hours=1)
-    ):
-        return {"predictions": _prediction_cache, "cached": True}
-
-    predictions = {}
-    for ticker in POPULAR_TICKERS:
-        pred = _get_ml_prediction(ticker)
-        predictions[ticker] = pred
-
-    _prediction_cache = predictions
-    _cache_timestamp = datetime.now()
-    return {"predictions": predictions, "cached": False}
+    stored = _stored_predictions(
+        POPULAR_TICKERS,
+        model_name="stock_predictor",
+    )
+    predictions = {prediction["ticker"]: prediction for prediction in stored}
+    return {"predictions": predictions, "cached": True}
 
 
 @app.get("/api/training/status")
@@ -658,9 +885,8 @@ async def api_training_start(model: str = Query("default")):
 async def api_sentiment():
     """Get current market sentiment data."""
     try:
-        from ml.sentiment.scrapers import scrape_all, get_aggregated_sentiment
+        from ml.sentiment.scrapers import get_aggregated_sentiment
 
-        scrape_all()
         sentiment = get_aggregated_sentiment()
         return {"sentiment": sentiment}
     except Exception as e:
@@ -674,74 +900,95 @@ async def api_intraday(
     interval: str = Query("5m", description="Bar interval"),
 ):
     """Get intraday OHLCV data for candlestick charts."""
-    try:
-        data = yfinance.Ticker(ticker.upper()).history(
-            period=period, interval=interval,
-        )
-        if data.empty:
-            return {"error": f"No intraday data for {ticker}"}
+    normalized = ticker.upper()
 
-        return {
-            "ticker": ticker.upper(),
+    def load() -> dict:
+        try:
+            data = yfinance.Ticker(normalized).history(
+                period=period,
+                interval=interval,
+            )
+            if data.empty:
+                return {"error": f"No intraday data for {normalized}"}
+            return {
+                "ticker": normalized,
+                "interval": interval,
+                "bars": [
+                    {
+                        "time": iso_utc(t),
+                        "open": round(float(row["Open"]), 2),
+                        "high": round(float(row["High"]), 2),
+                        "low": round(float(row["Low"]), 2),
+                        "close": round(float(row["Close"]), 2),
+                        "volume": int(row["Volume"]),
+                    }
+                    for t, row in data.iterrows()
+                ],
+                "predictions": [
+                    prediction
+                    for prediction in PredictionStore().get_history(
+                        ticker=normalized,
+                        limit=500,
+                    )
+                    if prediction["interval"].endswith(("m", "h"))
+                ][:100],
+            }
+        except Exception as exc:
+            return {"error": str(exc), "ticker": normalized}
+
+    return await run_in_threadpool(
+        _cached_payload,
+        f"intraday:{normalized}:{period}:{interval}",
+        load,
+        ttl_seconds=30,
+        fallback={
+            "ticker": normalized,
             "interval": interval,
-            "bars": [
-                {
-                    "time": iso_utc(t),
-                    "open": round(float(row["Open"]), 2),
-                    "high": round(float(row["High"]), 2),
-                    "low": round(float(row["Low"]), 2),
-                    "close": round(float(row["Close"]), 2),
-                    "volume": int(row["Volume"]),
-                }
-                for t, row in data.iterrows()
-            ],
-            "predictions": [
-                prediction
-                for prediction in PredictionStore().get_history(
-                    ticker=ticker.upper(),
-                    limit=500,
-                )
-                if prediction["interval"].endswith(("m", "h"))
-            ][:100],
-        }
-    except Exception as e:
-        return {"error": str(e)}
+            "bars": [],
+            "predictions": [],
+            "error": "Intraday data is refreshing",
+        },
+    )
 
 
 @app.get("/api/stock/{ticker}/daytrading/predict")
 async def api_daytrading_predict(ticker: str):
     """Get day trading prediction using the intraday HorizonModel."""
-    try:
-        from ml.multi_horizon import HorizonModel, HORIZONS
-
-        config = HORIZONS["intraday"]
-        model = HorizonModel(config)
-        model.load()
-        prediction = _normalize_model_prediction(
-            model.predict_ticker(ticker.upper())
+    normalized = ticker.upper()
+    predictions = _stored_predictions([normalized])
+    intraday = [
+        prediction
+        for prediction in predictions
+        if prediction["model_name"] in {
+            "model_realtime_5m",
+            "model_intraday",
+        }
+    ]
+    intraday.sort(
+        key=lambda prediction: (
+            prediction["model_name"] != "model_realtime_5m",
+            prediction["horizon"],
         )
-        prediction["horizon_bars"] = config.horizon
+    )
+    if intraday:
+        prediction = intraday[0]
+        prediction["horizon_bars"] = prediction["horizon"]
         prediction["model_status"] = "ready"
         return prediction
-    except FileNotFoundError:
-        return {
-            "ticker": ticker.upper(),
-            "direction": "N/A",
-            "predicted_return": 0,
-            "confidence": 0,
-            "model_status": "not_trained",
-            "message": "Intraday model not trained. Use: python main.py --mode ml-horizons-train --horizon intraday",
-        }
-    except Exception as e:
-        logger.debug("Day trading prediction failed for %s: %s", ticker, e)
-        return {
-            "ticker": ticker.upper(),
-            "direction": "N/A",
-            "predicted_return": 0,
-            "confidence": 0,
-            "model_status": "error",
-            "message": str(e),
-        }
+
+    refreshing = _schedule_prediction_refresh(normalized)
+    return {
+        "ticker": normalized,
+        "direction": "N/A",
+        "predicted_return": 0,
+        "confidence": 0,
+        "model_status": "refreshing" if refreshing else "not_trained",
+        "message": (
+            "Prediction is being generated in the background"
+            if refreshing
+            else "No intraday model is trained"
+        ),
+    }
 
 
 @app.post("/api/daytrading/train")
@@ -803,6 +1050,40 @@ async def api_timeframes():
 @app.on_event("startup")
 async def on_startup():
     """Auto-start model training when the server boots."""
+    def prewarm() -> None:
+        try:
+            _web_cache.get(
+                "market-overview",
+                lambda: {
+                    "indices": {
+                        name: {
+                            "price": round(float(data["Close"].iloc[-1]), 2),
+                            "change": round(
+                                float(data["Close"].pct_change().iloc[-1] * 100),
+                                2,
+                            ),
+                        }
+                        for symbol, name in [
+                            ("SPY", "S&P 500"),
+                            ("QQQ", "Nasdaq 100"),
+                            ("IWM", "Russell 2000"),
+                            ("DIA", "Dow Jones"),
+                            ("^VIX", "VIX"),
+                        ]
+                        if not (
+                            data := yfinance.Ticker(symbol).history(period="5d")
+                        ).empty
+                        and len(data) >= 2
+                    }
+                },
+                ttl_seconds=60,
+                wait_seconds=0,
+                fallback={"indices": {}},
+            )
+        except Exception:
+            logger.exception("Web cache prewarm failed")
+
+    threading.Thread(target=prewarm, name="web-cache-prewarm", daemon=True).start()
     if os.environ.get("WEBAPP_AUTO_TRAIN", "1").strip().lower() in {
         "0", "false", "no", "off",
     }:

@@ -34,6 +34,7 @@ from ..compute import (
     accelerated_classifier,
     accelerated_regressor,
     compute_backend,
+    model_worker_count,
 )
 from ..model import reconcile_prediction
 from ..persistence import atomic_pickle_dump
@@ -170,7 +171,7 @@ class CombinedPredictor:
                 )),
             ],
             voting="soft",
-            n_jobs=-1,
+            n_jobs=model_worker_count(),
         )
         self.regressor = accelerated_regressor(
             HistGradientBoostingRegressor(

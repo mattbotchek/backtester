@@ -42,6 +42,7 @@ from .compute import (
     accelerated_classifier,
     accelerated_regressor,
     compute_backend,
+    model_worker_count,
     parallel_map,
 )
 from .prediction_store import (
@@ -126,7 +127,7 @@ class StockPredictor:
                 ("rf", RandomForestClassifier(
                     n_estimators=300, max_depth=8, min_samples_leaf=30,
                     max_features="sqrt",
-                    random_state=42, n_jobs=-1
+                    random_state=42, n_jobs=model_worker_count()
                 )),
                 ("hgb", accelerated_classifier(
                     HistGradientBoostingClassifier(
@@ -149,7 +150,7 @@ class StockPredictor:
                 )),
             ],
             voting="soft",
-            n_jobs=-1,
+            n_jobs=model_worker_count(),
         )
 
         # Regression model for magnitude

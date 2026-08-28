@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import logging
+import multiprocessing
 import os
 import signal
 import sys
@@ -43,12 +44,15 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 
-def run_web_server(port: int):
+def run_web_server(port: int, coordinated_pipeline: bool = False):
     """Run the FastAPI web server."""
     import uvicorn
 
     # The coordinated pipeline owns retraining when run_server.py is used.
     os.environ["WEBAPP_AUTO_TRAIN"] = "0"
+    os.environ["WEBAPP_CONTINUOUS_PIPELINE"] = (
+        "1" if coordinated_pipeline else "0"
+    )
     logger.info("Starting web server on port %d...", port)
     uvicorn.run(
         "webapp.app:app",
@@ -145,7 +149,7 @@ def run_retrainer(interval_hours: int = 24):
         shutdown_event.wait(interval_hours * 3600)
 
 
-def run_continuous_pipeline(args):
+def run_continuous_pipeline(args, stop_event=None):
     """Run collection, predictions, forward scoring, and retraining together."""
     from main import ML_TRAINING_TICKERS
     from ml.continuous_training import run_continuous_training
@@ -167,7 +171,7 @@ def run_continuous_pipeline(args):
         enable_collection=not args.no_scraper,
         enable_predictions=not args.no_predictions,
         enable_retraining=not args.no_retrain,
-        stop_event=shutdown_event,
+        stop_event=stop_event or shutdown_event,
     )
 
 
@@ -193,16 +197,35 @@ def main():
     logger.info("  Auto-retrain: %s", "OFF" if args.no_retrain else f"every {args.retrain_hours}h")
     logger.info("=" * 50)
 
-    threads = []
+    pipeline_process = None
+    pipeline_stop_event = None
 
-    # One pipeline coordinates collection, prediction, settlement, and training.
-    if not (args.no_scraper and args.no_predictions and args.no_retrain):
-        t = threading.Thread(target=run_continuous_pipeline, args=(args,), daemon=True)
-        t.start()
-        threads.append(t)
+    # Keep CPU-heavy training and feature generation out of Uvicorn's process.
+    pipeline_enabled = not (
+        args.no_scraper and args.no_predictions and args.no_retrain
+    )
+    if pipeline_enabled:
+        context = multiprocessing.get_context("spawn")
+        pipeline_stop_event = context.Event()
+        pipeline_process = context.Process(
+            target=run_continuous_pipeline,
+            args=(args, pipeline_stop_event),
+            name="continuous-training",
+        )
+        pipeline_process.start()
 
-    # Run web server (blocks until shutdown)
-    run_web_server(args.port)
+    try:
+        # Run web server (blocks until shutdown)
+        run_web_server(args.port, coordinated_pipeline=pipeline_enabled)
+    finally:
+        shutdown_event.set()
+        if pipeline_stop_event is not None:
+            pipeline_stop_event.set()
+        if pipeline_process is not None:
+            pipeline_process.join(timeout=30)
+            if pipeline_process.is_alive():
+                pipeline_process.terminate()
+                pipeline_process.join(timeout=10)
 
 
 if __name__ == "__main__":

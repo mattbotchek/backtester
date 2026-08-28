@@ -34,6 +34,7 @@ from .features import (
     create_regression_target,
     _download_context,
 )
+from .compute import model_worker_count
 
 logging.basicConfig(
     level=logging.INFO,
@@ -224,7 +225,7 @@ def run_trial(
                 ("rf", RandomForestClassifier(
                     n_estimators=config.n_estimators, max_depth=config.max_depth,
                     min_samples_leaf=config.min_samples_leaf, max_features="sqrt",
-                    random_state=42, n_jobs=-1,
+                    random_state=42, n_jobs=model_worker_count(),
                 )),
                 ("hgb", HistGradientBoostingClassifier(
                     max_iter=config.n_estimators, max_depth=config.max_depth,

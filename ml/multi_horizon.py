@@ -46,6 +46,7 @@ from .compute import (
     accelerated_classifier,
     accelerated_regressor,
     compute_backend,
+    model_worker_count,
     parallel_map,
 )
 from .prediction_store import (
@@ -204,7 +205,7 @@ class HorizonModel:
                 max_features="sqrt",
                 class_weight="balanced",
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=model_worker_count(),
             )
         else:
             self.classifier = VotingClassifier(
@@ -214,7 +215,7 @@ class HorizonModel:
                         max_depth=config.max_depth,
                         min_samples_leaf=config.min_samples_leaf,
                         max_features="sqrt",
-                        random_state=42, n_jobs=-1,
+                        random_state=42, n_jobs=model_worker_count(),
                     )),
                     ("hgb", accelerated_classifier(
                         HistGradientBoostingClassifier(
@@ -243,7 +244,7 @@ class HorizonModel:
                     )),
                 ],
                 voting="soft",
-                n_jobs=-1,
+                n_jobs=model_worker_count(),
             )
 
         self.regressor = accelerated_regressor(

@@ -677,6 +677,48 @@ class PredictionStore:
         )
         return history[0] if history else None
 
+    def latest_predictions(
+        self,
+        *,
+        tickers: Iterable[str] | None = None,
+        model_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the newest immutable prediction for each ticker/model pair."""
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        normalized_tickers = sorted(
+            {ticker.upper() for ticker in tickers or [] if ticker}
+        )
+        if normalized_tickers:
+            placeholders = ",".join("?" for _ in normalized_tickers)
+            clauses.append(f"ticker IN ({placeholders})")
+            parameters.extend(normalized_tickers)
+        if model_name:
+            clauses.append("model_name=?")
+            parameters.append(model_name)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT
+                        p.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY p.ticker, p.model_name
+                            ORDER BY p.created_at DESC, p.id DESC
+                        ) AS prediction_rank
+                    FROM predictions p
+                    {where}
+                )
+                WHERE prediction_rank=1
+                ORDER BY ticker, model_name
+                """,
+                parameters,
+            ).fetchall()
+        return [_prediction_dict(row) for row in rows]
+
 
 def _fetch_market_prices(
     ticker: str,
@@ -735,6 +777,7 @@ def _bar_completion_time(timestamp: Any, interval: str) -> datetime:
 
 def _prediction_dict(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
+    item.pop("prediction_rank", None)
     item["hit"] = None if item["hit"] is None else bool(item["hit"])
     item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
     return item

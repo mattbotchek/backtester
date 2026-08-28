@@ -55,6 +55,13 @@ The continuous service keeps running after reaching the configured threshold so
 that new public information is collected, due forecasts are settled, drift is
 measured, and all model families continue to be refreshed.
 
+Continuous training runs in a separate process from Uvicorn and reserves two
+CPU cores by default, so model work cannot monopolize page-serving capacity.
+Set `ML_RESERVED_CPUS` or `ML_CPU_WORKERS` to tune that budget. Web requests
+serve predictions and sentiment from their durable ledgers. Live quotes use a
+persistent stale-while-refresh cache with a 3.5-second cold-load budget, and
+charts load Plotly after the initial page instead of blocking render.
+
 Run the continuous pipeline without the web server:
 
 ```bash

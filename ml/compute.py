@@ -24,6 +24,16 @@ def cpu_count() -> int:
     return max(1, detected or os.cpu_count() or 1)
 
 
+def model_worker_count() -> int:
+    """Leave CPU capacity available for the web process during model work."""
+    detected = cpu_count()
+    configured = int(os.getenv("ML_CPU_WORKERS", "0"))
+    if configured > 0:
+        return min(detected, configured)
+    reserved = max(0, int(os.getenv("ML_RESERVED_CPUS", "2")))
+    return max(1, detected - reserved)
+
+
 def io_worker_count(item_count: int | None = None) -> int:
     """Choose a bounded worker count for remote data collection."""
     configured = int(os.getenv("ML_IO_WORKERS", "0"))
@@ -99,7 +109,11 @@ def gpu_backend_available() -> bool:
 
 def compute_backend() -> str:
     """Describe the backend selected for model fitting and inference."""
-    return "xgboost-cuda" if gpu_backend_available() else f"sklearn-cpu-{cpu_count()}"
+    return (
+        "xgboost-cuda"
+        if gpu_backend_available()
+        else f"sklearn-cpu-{model_worker_count()}"
+    )
 
 
 class GPUXGBClassifier(ClassifierMixin, BaseEstimator):
@@ -139,7 +153,7 @@ class GPUXGBClassifier(ClassifierMixin, BaseEstimator):
             tree_method="hist",
             device="cuda",
             eval_metric="logloss",
-            n_jobs=cpu_count(),
+            n_jobs=model_worker_count(),
             random_state=self.random_state,
         )
         try:
@@ -199,7 +213,7 @@ class GPUXGBRegressor(RegressorMixin, BaseEstimator):
             tree_method="hist",
             device="cuda",
             objective="reg:squarederror",
-            n_jobs=cpu_count(),
+            n_jobs=model_worker_count(),
             random_state=self.random_state,
         )
         try:

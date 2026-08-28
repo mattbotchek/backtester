@@ -11,6 +11,7 @@ import pandas as pd
 
 from ml.prediction_store import PredictionStore
 from webapp import app as webapp
+from webapp.cache import PersistentTTLCache
 
 
 class PredictionApiTests(unittest.TestCase):
@@ -22,6 +23,12 @@ class PredictionApiTests(unittest.TestCase):
             {"PREDICTION_DB_PATH": str(self.database)},
         )
         self.environment.start()
+        self.web_cache = PersistentTTLCache(
+            Path(self.directory.name) / "web-cache.json",
+            max_workers=2,
+        )
+        self.cache_patch = patch.object(webapp, "_web_cache", self.web_cache)
+        self.cache_patch.start()
         webapp._last_settlement_at = None
         webapp._settlement_in_progress = False
         self.store = PredictionStore(self.database)
@@ -41,6 +48,8 @@ class PredictionApiTests(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.cache_patch.stop()
+        self.web_cache.close()
         self.environment.stop()
         self.directory.cleanup()
 
@@ -82,7 +91,11 @@ class PredictionApiTests(unittest.TestCase):
         ):
             asyncio.run(webapp.on_startup())
 
-        thread.assert_not_called()
+        targets = [
+            call.kwargs.get("target")
+            for call in thread.call_args_list
+        ]
+        self.assertNotIn(webapp._auto_train_models, targets)
 
     def test_endpoint_settlement_runs_network_work_in_background(self):
         entered = threading.Event()
@@ -111,6 +124,19 @@ class PredictionApiTests(unittest.TestCase):
         self.assertEqual("started", first["status"])
         self.assertEqual("in_progress", second["status"])
         self.assertFalse(webapp._settlement_in_progress)
+
+    def test_coordinated_pipeline_owns_automatic_settlement(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"WEBAPP_CONTINUOUS_PIPELINE": "1"},
+            ),
+            patch.object(webapp.PredictionStore, "settle_due") as settle_due,
+        ):
+            result = webapp._settle_due_predictions()
+
+        self.assertEqual("coordinated_pipeline", result["status"])
+        settle_due.assert_not_called()
 
     def test_intraday_bars_use_absolute_utc_timestamps(self):
         self.store.record_prediction(
@@ -154,6 +180,17 @@ class PredictionApiTests(unittest.TestCase):
             ["model_realtime_5m"],
             [item["model_name"] for item in response["predictions"]],
         )
+
+    def test_all_predictions_are_served_from_ledger(self):
+        with patch.object(webapp, "_get_all_ml_predictions") as live_prediction:
+            response = asyncio.run(webapp.api_all_predictions("AAPL"))
+
+        live_prediction.assert_not_called()
+        self.assertEqual(
+            ["model_short_1d"],
+            [item["model_name"] for item in response["predictions"]],
+        )
+        self.assertEqual(75.0, response["predictions"][0]["confidence"])
 
 
 if __name__ == "__main__":
