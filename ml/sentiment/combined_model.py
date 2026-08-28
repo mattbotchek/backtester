@@ -8,19 +8,36 @@ for temporal walk-forward evaluation.
 import logging
 import pickle
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance
-from sklearn.ensemble import HistGradientBoostingClassifier, VotingClassifier
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    VotingClassifier,
+)
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
-from ..features import compute_features, create_target, _download_context
+from ..features import (
+    compute_features,
+    create_regression_target,
+    create_target,
+    _download_context,
+)
+from ..compute import (
+    accelerated_classifier,
+    accelerated_regressor,
+    compute_backend,
+)
+from ..model import reconcile_prediction
+from ..persistence import atomic_pickle_dump
+from ..prediction_store import PredictionStore, prediction_target_time
 from .scrapers import (
     get_aggregated_sentiment,
     scrape_all,
@@ -127,15 +144,24 @@ class CombinedPredictor:
         self.feature_names: list[str] = []
         self.is_trained = False
         self._training_stats: dict = {}
+        self.model_name = "combined_model"
 
         # Model: HistGBM + RF ensemble
         self.classifier = VotingClassifier(
             estimators=[
-                ("hgb", HistGradientBoostingClassifier(
-                    max_iter=600, max_depth=7, min_samples_leaf=30,
-                    learning_rate=0.01, l2_regularization=2.0,
-                    max_bins=128, early_stopping=True,
-                    validation_fraction=0.15, random_state=42,
+                ("hgb", accelerated_classifier(
+                    HistGradientBoostingClassifier(
+                        max_iter=600, max_depth=7, min_samples_leaf=30,
+                        learning_rate=0.01, l2_regularization=2.0,
+                        max_bins=128, early_stopping=True,
+                        validation_fraction=0.15, random_state=42,
+                    ),
+                    n_estimators=600,
+                    max_depth=7,
+                    learning_rate=0.01,
+                    min_child_weight=30,
+                    reg_lambda=2.0,
+                    random_state=42,
                 )),
                 ("mlp", MLPClassifier(
                     hidden_layer_sizes=(128, 64, 32),
@@ -144,6 +170,25 @@ class CombinedPredictor:
                 )),
             ],
             voting="soft",
+            n_jobs=-1,
+        )
+        self.regressor = accelerated_regressor(
+            HistGradientBoostingRegressor(
+                max_iter=600,
+                max_depth=7,
+                min_samples_leaf=30,
+                learning_rate=0.01,
+                l2_regularization=2.0,
+                early_stopping=True,
+                validation_fraction=0.15,
+                random_state=42,
+            ),
+            n_estimators=600,
+            max_depth=7,
+            learning_rate=0.01,
+            min_child_weight=30,
+            reg_lambda=2.0,
+            random_state=42,
         )
 
     def prepare_data(
@@ -151,9 +196,9 @@ class CombinedPredictor:
         tickers: list[str],
         context: dict | None = None,
         vix_data: pd.Series | None = None,
-    ) -> tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
+    ) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.DatetimeIndex]:
         """Prepare combined features for all tickers."""
-        all_X, all_y, all_dates = [], [], []
+        all_X, all_y, all_reg, all_dates = [], [], [], []
 
         # Get VIX for sentiment proxy
         if vix_data is None and self.use_sentiment:
@@ -205,16 +250,26 @@ class CombinedPredictor:
 
                 # Target
                 target = create_target(data, horizon=self.horizon, threshold=self.threshold)
+                reg_target = create_regression_target(data, horizon=self.horizon)
 
-                common = quant_feat.index.intersection(target.dropna().index)
+                common = (
+                    quant_feat.index
+                    .intersection(target.dropna().index)
+                    .intersection(reg_target.dropna().index)
+                )
                 quant_feat = quant_feat.loc[common].replace([np.inf, -np.inf], np.nan).dropna()
-                common = quant_feat.index.intersection(target.index)
+                common = (
+                    quant_feat.index
+                    .intersection(target.index)
+                    .intersection(reg_target.index)
+                )
 
                 if len(common) < 100:
                     continue
 
                 all_X.append(quant_feat.loc[common])
                 all_y.append(target.loc[common])
+                all_reg.append(reg_target.loc[common])
                 all_dates.append(pd.Series(
                     quant_feat.loc[common].index,
                     index=range(len(quant_feat.loc[common])),
@@ -228,13 +283,20 @@ class CombinedPredictor:
 
         X = pd.concat(all_X, ignore_index=True)
         y = pd.concat(all_y, ignore_index=True)
+        y_reg = pd.concat(all_reg, ignore_index=True)
         dates = pd.concat(all_dates, ignore_index=True)
 
-        mask = X.notna().all(axis=1) & y.notna()
+        mask = X.notna().all(axis=1) & y.notna() & y_reg.notna()
+        X = X[mask].reset_index(drop=True)
+        y = y[mask].reset_index(drop=True)
+        y_reg = y_reg[mask].reset_index(drop=True)
+        dates = dates[mask].reset_index(drop=True)
+        order = dates.sort_values(kind="stable").index
         return (
-            X[mask].reset_index(drop=True),
-            y[mask].reset_index(drop=True),
-            dates[mask].reset_index(drop=True),
+            X.loc[order].reset_index(drop=True),
+            y.loc[order].reset_index(drop=True),
+            y_reg.loc[order].reset_index(drop=True),
+            dates.loc[order].reset_index(drop=True),
         )
 
     def train(self, tickers: list[str]) -> dict:
@@ -243,7 +305,7 @@ class CombinedPredictor:
         context = _download_context("5y", "1d")
 
         logger.info("Preparing combined features for %d tickers...", len(tickers))
-        X, y, dates = self.prepare_data(tickers, context)
+        X, y, y_reg, dates = self.prepare_data(tickers, context)
 
         self.feature_names = list(X.columns)
         logger.info("Training: %d samples, %d features", len(X), len(self.feature_names))
@@ -261,6 +323,7 @@ class CombinedPredictor:
 
         # Final fit on all data
         self.classifier.fit(X_scaled, y)
+        self.regressor.fit(X_scaled, y_reg)
         self.is_trained = True
 
         self._training_stats = {
@@ -271,6 +334,8 @@ class CombinedPredictor:
             "class_distribution": dict(y.value_counts()),
             "horizon": self.horizon,
             "threshold": self.threshold,
+            "trained_at": datetime.now(timezone.utc).isoformat(),
+            "compute_backend": compute_backend(),
         }
 
         logger.info(
@@ -279,6 +344,109 @@ class CombinedPredictor:
             self._training_stats["cv_accuracy_std"],
         )
         return self._training_stats
+
+    def predict(self, ticker: str) -> dict:
+        """Generate and persist a combined quantitative/sentiment prediction."""
+        if not self.is_trained:
+            raise RuntimeError("Model must be trained before predicting.")
+
+        context = _download_context("5y", "1d")
+
+        data = yfinance.Ticker(ticker).history(period="5y", interval="1d")
+        if data.empty:
+            raise ValueError(f"No data available for {ticker}")
+
+        features = compute_features(
+            data,
+            ticker=ticker,
+            include_cross_asset=True,
+            context=context,
+        )
+        if self.use_sentiment:
+            vix_history = yfinance.Ticker("^VIX").history(period="5y")
+            vix_data = vix_history["Close"] if not vix_history.empty else None
+            if vix_data is not None:
+                sentiment = _build_synthetic_sentiment_history(
+                    features.index,
+                    ticker=ticker,
+                    vix_data=vix_data,
+                )
+                sentiment_columns = [
+                    column
+                    for column in sentiment.columns
+                    if column not in features.columns
+                ]
+                features = pd.concat(
+                    [features, sentiment[sentiment_columns]],
+                    axis=1,
+                )
+        if self.use_macro:
+            macro = _build_macro_features(features.index)
+            macro_columns = [
+                column for column in macro.columns if column not in features.columns
+            ]
+            features = pd.concat([features, macro[macro_columns]], axis=1)
+
+        features = features.replace([np.inf, -np.inf], np.nan).dropna()
+        missing = set(self.feature_names) - set(features.columns)
+        if features.empty or missing:
+            raise ValueError(
+                f"Current data is missing {len(missing)} trained features"
+            )
+
+        input_at = features.index[-1]
+        X = features.iloc[[-1]][self.feature_names]
+        X_scaled = self.scaler.transform(X)
+        class_label = int(self.classifier.predict(X_scaled)[0])
+        raw_return = float(self.regressor.predict(X_scaled)[0])
+        probabilities = self.classifier.predict_proba(X_scaled)[0]
+        confidence = float(max(probabilities))
+        direction, predicted_return = reconcile_prediction(
+            class_label,
+            raw_return,
+        )
+        base_price = float(data.loc[input_at, "Close"])
+        target_at = prediction_target_time(input_at, self.horizon, "1d")
+
+        store = PredictionStore()
+        stored = store.record_prediction(
+            model_name=self.model_name,
+            family="CombinedPredictor",
+            ticker=ticker,
+            input_at=input_at,
+            target_at=target_at,
+            interval="1d",
+            horizon=self.horizon,
+            base_price=base_price,
+            predicted_return_pct=predicted_return * 100,
+            direction=direction,
+            confidence=confidence,
+            last_trained_at=self._training_stats.get("trained_at"),
+            training_metrics=self._training_stats,
+            metadata={
+                "use_sentiment": self.use_sentiment,
+                "use_macro": self.use_macro,
+            },
+        )
+        statistics = store.model_statistics(self.model_name)
+        model_stats = statistics[0] if statistics else {}
+        return {
+            "model_name": self.model_name,
+            "ticker": ticker.upper(),
+            "direction": direction,
+            "predicted_return": predicted_return * 100,
+            "confidence": confidence,
+            "created_at": stored["created_at"],
+            "input_at": stored["input_at"],
+            "target_at": stored["target_at"],
+            "base_price": stored["base_price"],
+            "predicted_price": stored["predicted_price"],
+            "last_trained_at": model_stats.get("last_trained_at"),
+            "forward_accuracy": model_stats.get("forward_accuracy"),
+            "settled_predictions": model_stats.get("settled_count", 0),
+            "interval": "1d",
+            "horizon": self.horizon,
+        }
 
     def walk_forward_backtest(
         self,
@@ -291,7 +459,7 @@ class CombinedPredictor:
         context = _download_context("5y", "1d")
 
         logger.info("Preparing data for walk-forward...")
-        X, y, dates = self.prepare_data(tickers, context)
+        X, y, _, dates = self.prepare_data(tickers, context)
 
         all_dates_sorted = dates.sort_values()
         unique_dates = sorted(dates.unique())
@@ -386,16 +554,28 @@ class CombinedPredictor:
         }
 
     def save(self, name: str = "combined_model"):
+        self.model_name = name
         path = MODEL_DIR / f"{name}.pkl"
-        with open(path, "wb") as f:
-            pickle.dump({
-                "classifier": self.classifier,
-                "scaler": self.scaler,
-                "feature_names": self.feature_names,
-                "training_stats": self._training_stats,
-                "horizon": self.horizon,
-                "threshold": self.threshold,
-            }, f)
+        atomic_pickle_dump({
+            "classifier": self.classifier,
+            "regressor": self.regressor,
+            "scaler": self.scaler,
+            "feature_names": self.feature_names,
+            "training_stats": self._training_stats,
+            "horizon": self.horizon,
+            "threshold": self.threshold,
+            "use_sentiment": self.use_sentiment,
+            "use_macro": self.use_macro,
+            "model_name": self.model_name,
+        }, path)
+        PredictionStore().register_model(
+            model_name=self.model_name,
+            family="CombinedPredictor",
+            horizon=self.horizon,
+            interval="1d",
+            last_trained_at=self._training_stats.get("trained_at"),
+            training_metrics=self._training_stats,
+        )
         logger.info("Saved model to %s", path)
 
     def load(self, name: str = "combined_model"):
@@ -403,12 +583,24 @@ class CombinedPredictor:
         with open(path, "rb") as f:
             data = pickle.load(f)
         self.classifier = data["classifier"]
+        self.regressor = data.get("regressor", self.regressor)
         self.scaler = data["scaler"]
         self.feature_names = data["feature_names"]
         self._training_stats = data["training_stats"]
         self.horizon = data["horizon"]
         self.threshold = data["threshold"]
+        self.use_sentiment = data.get("use_sentiment", self.use_sentiment)
+        self.use_macro = data.get("use_macro", self.use_macro)
+        self.model_name = data.get("model_name", name)
         self.is_trained = True
+        PredictionStore().register_model(
+            model_name=self.model_name,
+            family="CombinedPredictor",
+            horizon=self.horizon,
+            interval="1d",
+            last_trained_at=self._training_stats.get("trained_at"),
+            training_metrics=self._training_stats,
+        )
 
 
 def accuracy_loop(
@@ -416,10 +608,18 @@ def accuracy_loop(
     target_accuracy: float = 0.65,
     max_iterations: int = 10,
 ) -> dict:
-    """Loop training/backtesting until target accuracy or exhausted."""
+    """Tune against historical walk-forward results for offline research."""
     logger.info("=" * 60)
-    logger.info("COMBINED MODEL ACCURACY LOOP")
-    logger.info("  Target: %.0f%%, Max iterations: %d", target_accuracy * 100, max_iterations)
+    logger.info("COMBINED MODEL HISTORICAL TUNING LOOP")
+    logger.info(
+        "  Historical target: %.0f%%, Max iterations: %d",
+        target_accuracy * 100,
+        max_iterations,
+    )
+    logger.info(
+        "  This backtest cannot satisfy the live future accuracy gate; "
+        "only settled PredictionStore outcomes can."
+    )
     logger.info("=" * 60)
 
     best_accuracy = 0
@@ -480,7 +680,7 @@ def accuracy_loop(
                 logger.info("  ** NEW BEST: %.3f **", acc)
 
                 if acc >= target_accuracy:
-                    logger.info("TARGET REACHED!")
+                    logger.info("HISTORICAL RESEARCH TARGET REACHED")
                     model.train(tickers)
                     model.save(f"combined_h{horizon}")
                     break
@@ -490,10 +690,10 @@ def accuracy_loop(
 
     # Print summary
     print("\n" + "=" * 60)
-    print("ACCURACY LOOP SUMMARY")
+    print("HISTORICAL TUNING SUMMARY")
     print("=" * 60)
     if best_config:
-        print(f"Best overall accuracy: {best_accuracy:.3f}")
+        print(f"Best historical walk-forward accuracy: {best_accuracy:.3f}")
         print(f"Config: horizon={best_config['horizon']}, window={best_config['train_window']}, step={best_config['step_size']}")
         conf = best_config["result"].get("confidence_filtered", {})
         for k, v in conf.items():

@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .model import StockPredictor, Prediction
+from .prediction_store import PredictionStore
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +79,10 @@ def run_headless(
         csv_writer = csv.writer(csv_file)
         if Path(output_file).stat().st_size == 0:
             csv_writer.writerow([
-                "Timestamp", "Ticker", "Direction", "Predicted Return %",
-                "Confidence", "Outliers"
+                "Recorded At", "Model", "Ticker", "Input At", "Target At",
+                "Base Price", "Predicted Price", "Direction",
+                "Predicted Return %", "Confidence", "Forward Accuracy",
+                "Settled Predictions", "Last Trained At", "Outliers",
             ])
 
     # Graceful shutdown
@@ -98,6 +101,9 @@ def run_headless(
         print(f"\n{'=' * 70}")
         print(f"  ANALYSIS CYCLE #{cycle} — {timestamp}")
         print(f"{'=' * 70}")
+        settlement = PredictionStore().settle_due()
+        if settlement["settled"]:
+            print(f"  Settled {settlement['settled']} due prediction(s)")
 
         predictions = []
         for ticker in tickers:
@@ -108,9 +114,20 @@ def run_headless(
 
                 if csv_writer:
                     csv_writer.writerow([
-                        timestamp, pred.ticker, pred.direction,
+                        pred.timestamp, pred.model_name, pred.ticker,
+                        pred.input_at, pred.predicted_for,
+                        f"{pred.base_price:.4f}",
+                        f"{pred.predicted_price:.4f}",
+                        pred.direction,
                         f"{pred.predicted_return_pct:.4f}",
                         f"{pred.confidence:.4f}",
+                        (
+                            f"{pred.forward_accuracy:.4f}"
+                            if pred.forward_accuracy is not None
+                            else ""
+                        ),
+                        pred.settled_predictions,
+                        pred.last_trained_at or "",
                         "; ".join(pred.outliers) if pred.outliers else "",
                     ])
             except Exception as e:

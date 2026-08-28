@@ -11,6 +11,7 @@ Includes:
 """
 
 import logging
+import threading
 import warnings
 from functools import lru_cache
 
@@ -21,6 +22,8 @@ warnings.filterwarnings("ignore", message="DataFrame is highly fragmented")
 import numpy as np
 import pandas as pd
 import yfinance
+
+from .compute import parallel_map
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,12 @@ MARKET_CONTEXT_TICKERS = {
     "GLD": "gold",           # Gold
     "UUP": "dollar",         # US Dollar index
     "HYG": "high_yield",     # High yield corporate bonds
+    "^TNX": "treasury_10y",   # 10-year Treasury yield
+    "^IRX": "treasury_3m",    # 3-month Treasury yield
+    "RSP": "equal_weight",    # Equal-weight S&P breadth proxy
+    "CL=F": "crude_oil",      # Crude oil futures
+    "HG=F": "copper",         # Copper growth proxy
+    "BTC-USD": "bitcoin",     # Crypto risk appetite
 }
 
 SECTOR_ETFS = {
@@ -67,26 +76,56 @@ TICKER_SECTOR_MAP = {
 }
 
 
-_context_cache: dict[str, pd.DataFrame] = {}
+_context_cache: dict[str, dict[str, pd.DataFrame]] = {}
+_context_cache_lock = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _alternative_data_store():
+    from .alternative_data import AlternativeDataStore
+
+    return AlternativeDataStore()
+
+
+def _add_alternative_data_features(
+    feat: pd.DataFrame,
+    ticker: str,
+) -> pd.DataFrame:
+    if not ticker:
+        return feat
+    alternative = _alternative_data_store().get_feature_frame(
+        ticker,
+        feat.index,
+        lookback_days=30,
+    )
+    return pd.concat([feat, alternative], axis=1)
 
 
 def _download_context(period: str = "5y", interval: str = "1d") -> dict[str, pd.DataFrame]:
     """Download market context data (cached per session)."""
     cache_key = f"{period}_{interval}"
-    if cache_key in _context_cache:
-        return {cache_key: _context_cache[cache_key]}
+    with _context_cache_lock:
+        if cache_key in _context_cache:
+            return _context_cache[cache_key]
 
     all_tickers = list(MARKET_CONTEXT_TICKERS.keys()) + list(SECTOR_ETFS.keys())
-    context = {}
-    for ticker in all_tickers:
+
+    def download(ticker: str) -> tuple[str, pd.DataFrame | None]:
         try:
             data = yfinance.Ticker(ticker).history(period=period, interval=interval)
             if not data.empty:
-                context[ticker] = data
-        except Exception:
-            pass
+                return ticker, data
+        except Exception as exc:
+            logger.debug("Market context download failed for %s: %s", ticker, exc)
+        return ticker, None
 
-    _context_cache[cache_key] = context
+    context = {
+        ticker: data
+        for ticker, data in parallel_map(download, all_tickers)
+        if data is not None
+    }
+    with _context_cache_lock:
+        _context_cache[cache_key] = context
     return context
 
 
@@ -134,12 +173,54 @@ def _add_cross_asset_features(
         if not tech.isna().all() and not util.isna().all():
             feat["risk_on_off"] = tech.pct_change(20) - util.pct_change(20)
 
+    if "RSP" in context and "SPY" in context:
+        equal_weight = context["RSP"]["Close"].reindex(feat.index, method="ffill")
+        cap_weight = context["SPY"]["Close"].reindex(feat.index, method="ffill")
+        feat["market_breadth_5d"] = (
+            equal_weight.pct_change(5) - cap_weight.pct_change(5)
+        )
+        feat["market_breadth_20d"] = (
+            equal_weight.pct_change(20) - cap_weight.pct_change(20)
+        )
+
+    if "XLY" in context and "XLP" in context:
+        discretionary = context["XLY"]["Close"].reindex(feat.index, method="ffill")
+        staples = context["XLP"]["Close"].reindex(feat.index, method="ffill")
+        feat["consumer_risk_appetite"] = (
+            discretionary.pct_change(20) - staples.pct_change(20)
+        )
+
     # Credit spread proxy: HYG vs TLT
     if "HYG" in context and "TLT" in context:
         hyg = context["HYG"]["Close"].reindex(feat.index, method="ffill")
         tlt = context["TLT"]["Close"].reindex(feat.index, method="ffill")
         if not hyg.isna().all() and not tlt.isna().all():
             feat["credit_spread_proxy"] = hyg.pct_change(20) - tlt.pct_change(20)
+
+    if "^TNX" in context and "^IRX" in context:
+        ten_year = context["^TNX"]["Close"].reindex(feat.index, method="ffill")
+        three_month = context["^IRX"]["Close"].reindex(feat.index, method="ffill")
+        feat["yield_curve_10y_3m"] = ten_year - three_month
+        feat["yield_curve_change_20d"] = feat["yield_curve_10y_3m"].diff(20)
+
+    if "SPY" in context and "Close" in feat.columns:
+        market_return = (
+            context["SPY"]["Close"]
+            .reindex(feat.index, method="ffill")
+            .pct_change()
+        )
+        stock_return = feat["Close"].pct_change()
+        market_variance = market_return.rolling(60).var()
+        feat["market_beta_60d"] = (
+            stock_return.rolling(60).cov(market_return) / market_variance
+        )
+        feat["market_corr_60d"] = stock_return.rolling(60).corr(market_return)
+        feat["market_relative_20d"] = (
+            feat["Close"].pct_change(20)
+            - context["SPY"]["Close"]
+            .reindex(feat.index, method="ffill")
+            .pct_change(20)
+        )
 
     return feat
 
@@ -148,6 +229,7 @@ def compute_features(
     df: pd.DataFrame,
     ticker: str = "",
     include_cross_asset: bool = True,
+    include_alternative_data: bool = True,
     context: dict[str, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
     """Compute technical indicator features from OHLCV data.
@@ -156,6 +238,7 @@ def compute_features(
         df: DataFrame with columns Open, High, Low, Close, Volume.
         ticker: Ticker symbol (used for sector-relative features).
         include_cross_asset: Whether to add market context features.
+        include_alternative_data: Whether to add point-in-time public data.
         context: Pre-downloaded context data (avoids re-downloading).
     """
     feat = df.copy()
@@ -235,12 +318,88 @@ def compute_features(
     feat["atr_14"] = tr.rolling(14).mean()
     feat["atr_ratio"] = feat["atr_14"] / feat["Close"]
 
+    # ── Trend Strength / Directional Movement ──
+    up_move = feat["High"].diff()
+    down_move = -feat["Low"].diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    atr_sum = tr.rolling(14).sum()
+    feat["plus_di_14"] = 100 * plus_dm.rolling(14).sum() / atr_sum
+    feat["minus_di_14"] = 100 * minus_dm.rolling(14).sum() / atr_sum
+    dx_denominator = feat["plus_di_14"] + feat["minus_di_14"]
+    feat["adx_14"] = (
+        100
+        * (feat["plus_di_14"] - feat["minus_di_14"]).abs()
+        / dx_denominator
+    ).rolling(14).mean()
+
+    # ── Commodity Channel / Money Flow ──
+    typical_price = (feat["High"] + feat["Low"] + feat["Close"]) / 3
+    typical_sma = typical_price.rolling(20).mean()
+    mean_deviation = typical_price.rolling(20).apply(
+        lambda values: np.mean(np.abs(values - values.mean())),
+        raw=True,
+    )
+    feat["cci_20"] = (typical_price - typical_sma) / (0.015 * mean_deviation)
+    raw_money_flow = typical_price * feat["Volume"]
+    positive_flow = raw_money_flow.where(typical_price.diff() > 0, 0.0)
+    negative_flow = raw_money_flow.where(typical_price.diff() < 0, 0.0)
+    money_ratio = (
+        positive_flow.rolling(14).sum()
+        / negative_flow.rolling(14).sum()
+    )
+    feat["mfi_14"] = 100 - (100 / (1 + money_ratio))
+    feat["chaikin_money_flow_20"] = (
+        (
+            ((feat["Close"] - feat["Low"]) - (feat["High"] - feat["Close"]))
+            / (feat["High"] - feat["Low"])
+        )
+        * feat["Volume"]
+    ).rolling(20).sum() / feat["Volume"].rolling(20).sum()
+
     # ── Stochastic ──
     for period in [14, 21]:
         low_n = feat["Low"].rolling(period).min()
         high_n = feat["High"].rolling(period).max()
         feat[f"stoch_k_{period}"] = ((feat["Close"] - low_n) / (high_n - low_n)) * 100
         feat[f"stoch_d_{period}"] = feat[f"stoch_k_{period}"].rolling(3).mean()
+        feat[f"williams_r_{period}"] = (
+            -100 * (high_n - feat["Close"]) / (high_n - low_n)
+        )
+
+    # ── Breakout / Channel Strategies ──
+    donchian_high = feat["High"].rolling(20).max()
+    donchian_low = feat["Low"].rolling(20).min()
+    feat["donchian_position_20"] = (
+        (feat["Close"] - donchian_low) / (donchian_high - donchian_low)
+    )
+    feat["donchian_breakout_up"] = (
+        feat["Close"] >= donchian_high.shift(1)
+    ).astype(int)
+    feat["donchian_breakout_down"] = (
+        feat["Close"] <= donchian_low.shift(1)
+    ).astype(int)
+    ema20 = feat["Close"].ewm(span=20, adjust=False).mean()
+    feat["keltner_position"] = (
+        (feat["Close"] - (ema20 - 2 * feat["atr_14"]))
+        / (4 * feat["atr_14"])
+    )
+
+    # ── Ichimoku ──
+    conversion = (
+        feat["High"].rolling(9).max() + feat["Low"].rolling(9).min()
+    ) / 2
+    base = (
+        feat["High"].rolling(26).max() + feat["Low"].rolling(26).min()
+    ) / 2
+    span_a = (conversion + base) / 2
+    span_b = (
+        feat["High"].rolling(52).max() + feat["Low"].rolling(52).min()
+    ) / 2
+    feat["ichimoku_conversion_base"] = conversion / base - 1
+    feat["ichimoku_cloud_position"] = (
+        (feat["Close"] - span_a) / (span_a - span_b).abs()
+    )
 
     # ── OBV ──
     direction = np.sign(feat["Close"].diff())
@@ -257,6 +416,11 @@ def compute_features(
     feat["pct_from_52w_low"] = feat["Close"] / feat["Low"].rolling(252).min() - 1
     feat["pct_from_20d_high"] = feat["Close"] / feat["High"].rolling(20).max() - 1
     feat["pct_from_20d_low"] = feat["Close"] / feat["Low"].rolling(20).min() - 1
+    feat["roc_10"] = feat["Close"].pct_change(10)
+    feat["roc_20"] = feat["Close"].pct_change(20)
+    feat["drawdown_60d"] = (
+        feat["Close"] / feat["Close"].rolling(60).max() - 1
+    )
 
     # ── Lag Features ──
     for lag in [1, 2, 3, 5, 10]:
@@ -270,6 +434,17 @@ def compute_features(
     )
     feat["skew_20d"] = feat["return_1d"].rolling(20).skew()
     feat["kurt_20d"] = feat["return_1d"].rolling(20).kurt()
+    feat["downside_volatility_20d"] = (
+        feat["return_1d"].where(feat["return_1d"] < 0, 0).rolling(20).std()
+    )
+    feat["return_autocorr_20d"] = feat["return_1d"].rolling(20).corr(
+        feat["return_1d"].shift(1)
+    )
+    feat["price_volume_corr_20d"] = feat["return_1d"].rolling(20).corr(
+        feat["volume_ratio"].pct_change()
+    )
+
+    feat = feat.copy()
 
     # ── Streaks ──
     up_streak = (feat["return_1d"] > 0).astype(int)
@@ -295,17 +470,11 @@ def compute_features(
         if context is None:
             period = "5y"
             interval = "1d"
-            context_data = _download_context(period, interval)
-            # Flatten cache
-            ctx = {}
-            for v in context_data.values():
-                if isinstance(v, dict):
-                    ctx.update(v)
-                else:
-                    ctx = context_data
-                    break
-            context = ctx
+            context = _download_context(period, interval)
         feat = _add_cross_asset_features(feat, context, ticker)
+
+    if include_alternative_data:
+        feat = _add_alternative_data_features(feat, ticker)
 
     # ── Calendar Features ──
     if hasattr(feat.index, 'dayofweek'):
@@ -337,7 +506,11 @@ def compute_features(
     return feat[feature_cols].dropna()
 
 
-def compute_intraday_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_intraday_features(
+    df: pd.DataFrame,
+    ticker: str = "",
+    include_alternative_data: bool = True,
+) -> pd.DataFrame:
     """Compute features for intraday (minute/hour) data.
 
     Simpler feature set that doesn't require 200+ periods of warmup.
@@ -397,10 +570,63 @@ def compute_intraday_features(df: pd.DataFrame) -> pd.DataFrame:
     high14 = feat["High"].rolling(14).max()
     feat["stoch_k"] = ((feat["Close"] - low14) / (high14 - low14)) * 100
 
+    if include_alternative_data:
+        feat = _add_alternative_data_features(feat, ticker)
+
     drop_cols = {"Open", "High", "Low", "Close", "Volume", "Dividends",
                  "Stock Splits", "Capital Gains", "cum_vol", "cum_vp", "vwap"}
     feature_cols = [c for c in feat.columns if c not in drop_cols]
     return feat[feature_cols].dropna()
+
+
+def compute_realtime_features(
+    df: pd.DataFrame,
+    market_data: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute the validated one-minute feature schema."""
+    close = df["Close"].astype(float)
+    volume = df["Volume"].astype(float)
+    feat = pd.DataFrame(index=df.index)
+
+    for period in [1, 2, 3, 5, 10, 15, 30, 60]:
+        feat[f"return_{period}"] = close.pct_change(period)
+
+    returns = close.pct_change()
+    for window in [5, 10, 20, 30, 60]:
+        feat[f"mean_{window}"] = returns.rolling(window).mean()
+        feat[f"vol_{window}"] = returns.rolling(window).std()
+        feat[f"price_z_{window}"] = (
+            close / close.rolling(window).mean() - 1
+        )
+        feat[f"volume_{window}"] = volume / volume.rolling(window).mean()
+
+    delta = close.diff()
+    for window in [7, 14, 28]:
+        gain = delta.clip(lower=0).rolling(window).mean()
+        loss = (-delta.clip(upper=0)).rolling(window).mean()
+        feat[f"rsi_{window}"] = 100 - 100 / (1 + gain / loss)
+
+    price_range = df["High"] - df["Low"]
+    feat["range"] = price_range / close
+    feat["close_location"] = (close - df["Low"]) / price_range
+    feat["spread_open"] = close / df["Open"] - 1
+
+    minute = df.index.hour * 60 + df.index.minute
+    session_minute = minute - (9 * 60 + 30)
+    feat["session_progress"] = session_minute / 390
+    feat["session_sin"] = np.sin(2 * np.pi * session_minute / 390)
+    feat["session_cos"] = np.cos(2 * np.pi * session_minute / 390)
+
+    market_close = market_data["Close"].reindex(df.index).ffill()
+    for period in [1, 3, 5, 10, 30]:
+        market_return = market_close.pct_change(period)
+        feat[f"market_return_{period}"] = market_return
+        feat[f"relative_return_{period}"] = (
+            close.pct_change(period) - market_return
+        )
+    feat["market_vol_20"] = market_close.pct_change().rolling(20).std()
+
+    return feat.replace([np.inf, -np.inf], np.nan).dropna()
 
 
 def create_target(df: pd.DataFrame, horizon: int = 5, threshold: float = 0.0) -> pd.Series:
@@ -423,3 +649,23 @@ def create_target(df: pd.DataFrame, horizon: int = 5, threshold: float = 0.0) ->
 def create_regression_target(df: pd.DataFrame, horizon: int = 5) -> pd.Series:
     """Create forward-looking regression target (% return)."""
     return df["Close"].pct_change(horizon).shift(-horizon).rename("target_return")
+
+
+def create_intraday_targets(
+    df: pd.DataFrame,
+    horizon: int,
+    threshold: float,
+) -> tuple[pd.Series, pd.Series]:
+    """Create targets without allowing a horizon to cross a market session."""
+    close = df["Close"]
+    session = pd.Series(df.index.date, index=df.index)
+    future_close = close.groupby(session).shift(-horizon)
+    future_return = future_close / close - 1
+
+    classification = pd.Series(0, index=df.index, name="target")
+    classification[future_return > threshold] = 1
+    classification[future_return <= -threshold] = -1
+    if threshold == 0:
+        classification[future_return == 0] = 1
+    classification[future_return.isna()] = np.nan
+    return classification, future_return.rename("target_return")

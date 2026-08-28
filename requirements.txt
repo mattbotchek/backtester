@@ -11,3 +11,4 @@ uvicorn[standard]
 jinja2
 aiofiles
 plotly
+exchange-calendars

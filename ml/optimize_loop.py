@@ -1,7 +1,8 @@
-"""Automated accuracy optimization loop.
+"""Offline model-selection loop.
 
-Trains models with different configurations, runs walk-forward backtests,
-and iterates until accuracy targets are met or all options exhausted.
+Trains different configurations, runs temporal CV and a cross-sectional
+unseen-ticker holdout, then refines the strongest candidates. These historical
+research scores do not satisfy the live-forward production accuracy gate.
 
 Usage:
     python -m ml.optimize_loop [--horizon short_5d] [--target 0.70]
@@ -103,8 +104,8 @@ def prepare_features(
     threshold: float,
     smooth: int = 0,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Prepare features and targets for all tickers."""
-    all_X, all_y = [], []
+    """Prepare globally time-ordered features and targets for all tickers."""
+    all_X, all_y, all_dates = [], [], []
 
     for ticker, data in ticker_data.items():
         try:
@@ -131,6 +132,7 @@ def prepare_features(
 
             all_X.append(features.loc[common])
             all_y.append(target.loc[common])
+            all_dates.append(pd.Series(features.loc[common].index))
         except Exception as e:
             logger.debug("Error with %s: %s", ticker, e)
 
@@ -139,9 +141,17 @@ def prepare_features(
 
     X = pd.concat(all_X, ignore_index=True)
     y = pd.concat(all_y, ignore_index=True)
+    dates = pd.concat(all_dates, ignore_index=True)
 
     mask = X.notna().all(axis=1) & y.notna()
-    return X[mask].reset_index(drop=True), y[mask].reset_index(drop=True)
+    X = X[mask].reset_index(drop=True)
+    y = y[mask].reset_index(drop=True)
+    dates = dates[mask].reset_index(drop=True)
+    order = dates.sort_values(kind="stable").index
+    return (
+        X.loc[order].reset_index(drop=True),
+        y.loc[order].reset_index(drop=True),
+    )
 
 
 def select_features(X: pd.DataFrame, y: pd.Series, top_k: int) -> list[str]:
@@ -168,7 +178,7 @@ def run_trial(
     context: dict,
     n_splits: int = 5,
 ) -> dict:
-    """Run one trial: train + walk-forward backtest."""
+    """Run one trial with temporal CV and a cross-sectional ticker holdout."""
     logger.info("=== Trial: %s ===", config.name)
     logger.info(
         "  horizon=%d, threshold=%.4f, depth=%d, lr=%.3f, l2=%.1f, top_k=%d, smooth=%d, hgb_only=%s",
@@ -239,7 +249,7 @@ def run_trial(
     cv_std = np.std(cv_scores)
     logger.info("  CV accuracy: %.3f +/- %.3f", cv_mean, cv_std)
 
-    # Walk-forward backtest on test tickers
+    # Cross-sectional holdout on unseen tickers from the same time range.
     try:
         X_test, y_test = prepare_features(
             test_data, context, config.horizon, config.threshold, config.smooth_target,
@@ -247,21 +257,21 @@ def run_trial(
     except ValueError:
         return {
             "trial": config.name, "cv_accuracy": cv_mean, "cv_std": cv_std,
-            "wf_accuracy": None, "error": "No test data",
+            "heldout_accuracy": None, "error": "No test data",
         }
 
     X_test = X_test[[c for c in feature_cols if c in X_test.columns]]
     if len(X_test.columns) < len(feature_cols) * 0.5:
         return {
             "trial": config.name, "cv_accuracy": cv_mean, "cv_std": cv_std,
-            "wf_accuracy": None, "error": "Feature mismatch",
+            "heldout_accuracy": None, "error": "Feature mismatch",
         }
 
     # Train on full training set, test on held-out tickers
     model.fit(X_scaled, y_train)
     X_test_scaled = scaler.transform(X_test)
     preds = model.predict(X_test_scaled)
-    wf_accuracy = accuracy_score(y_test, preds)
+    heldout_accuracy = accuracy_score(y_test, preds)
 
     # Directional accuracy
     dir_mask = (y_test != 0) | (pd.Series(preds) != 0)
@@ -271,14 +281,19 @@ def run_trial(
 
     n_classes = len(set(y_test) | set(preds))
 
-    logger.info("  Walk-forward accuracy: %.3f (%d predictions, %d classes)", wf_accuracy, len(y_test), n_classes)
+    logger.info(
+        "  Held-out ticker accuracy: %.3f (%d predictions, %d classes)",
+        heldout_accuracy,
+        len(y_test),
+        n_classes,
+    )
     logger.info("  Directional accuracy: %.3f", dir_acc)
 
     return {
         "trial": config.name,
         "cv_accuracy": float(cv_mean),
         "cv_std": float(cv_std),
-        "wf_accuracy": float(wf_accuracy),
+        "heldout_accuracy": float(heldout_accuracy),
         "directional_accuracy": float(dir_acc),
         "n_train": len(X_train),
         "n_test": len(y_test),
@@ -366,8 +381,16 @@ def run_optimization_loop(
 ):
     """Main optimization loop."""
     logger.info("=" * 60)
-    logger.info("ACCURACY OPTIMIZATION LOOP")
-    logger.info("  Horizon: %d days, Target: %.0f%%", horizon, target_accuracy * 100)
+    logger.info("OFFLINE MODEL TUNING LOOP")
+    logger.info(
+        "  Horizon: %d days, held-out ticker research target: %.0f%%",
+        horizon,
+        target_accuracy * 100,
+    )
+    logger.info(
+        "  This score is not live future accuracy; production gating uses "
+        "ContinuousTrainingService settled outcomes."
+    )
     logger.info("=" * 60)
 
     # Download data once
@@ -395,21 +418,25 @@ def run_optimization_loop(
             round_results.append(result)
             all_results.append(result)
 
-            wf = result.get("wf_accuracy")
-            if wf and wf > best_accuracy:
-                best_accuracy = wf
+            heldout = result.get("heldout_accuracy")
+            if heldout and heldout > best_accuracy:
+                best_accuracy = heldout
                 best_trial = result
                 logger.info("  ** NEW BEST: %.3f **", best_accuracy)
 
                 if best_accuracy >= target_accuracy:
-                    logger.info("TARGET REACHED: %.3f >= %.3f", best_accuracy, target_accuracy)
+                    logger.info(
+                        "HELD-OUT RESEARCH TARGET REACHED: %.3f >= %.3f",
+                        best_accuracy,
+                        target_accuracy,
+                    )
                     _print_summary(all_results, best_trial)
                     return all_results
 
         # Generate next round based on best results
         top_results = sorted(
-            [r for r in round_results if r.get("wf_accuracy")],
-            key=lambda r: r["wf_accuracy"],
+            [r for r in round_results if r.get("heldout_accuracy")],
+            key=lambda r: r["heldout_accuracy"],
             reverse=True,
         )[:3]
 
@@ -450,20 +477,27 @@ def _print_summary(results: list[dict], best: dict | None):
     print("OPTIMIZATION SUMMARY")
     print("=" * 70)
 
-    valid = [r for r in results if r.get("wf_accuracy") is not None]
-    valid.sort(key=lambda r: r["wf_accuracy"], reverse=True)
+    valid = [r for r in results if r.get("heldout_accuracy") is not None]
+    valid.sort(key=lambda r: r["heldout_accuracy"], reverse=True)
 
-    print(f"\n{'Trial':<30} {'CV':>8} {'WF':>8} {'Dir':>8} {'#Feat':>6} {'Classes':>8}")
+    print(
+        f"\n{'Trial':<30} {'CV':>8} {'Heldout':>8} "
+        f"{'Dir':>8} {'#Feat':>6} {'Classes':>8}"
+    )
     print("-" * 70)
     for r in valid[:20]:
         print(
-            f"{r['trial']:<30} {r['cv_accuracy']:>7.3f} {r['wf_accuracy']:>7.3f} "
+            f"{r['trial']:<30} {r['cv_accuracy']:>7.3f} "
+            f"{r['heldout_accuracy']:>7.3f} "
             f"{r.get('directional_accuracy', 0):>7.3f} {r.get('n_features', 0):>6} "
             f"{r.get('n_classes', 0):>8}"
         )
 
     if best:
-        print(f"\nBest: {best['trial']} — WF accuracy: {best['wf_accuracy']:.3f}")
+        print(
+            f"\nBest: {best['trial']} - held-out ticker accuracy: "
+            f"{best['heldout_accuracy']:.3f}"
+        )
 
 
 if __name__ == "__main__":

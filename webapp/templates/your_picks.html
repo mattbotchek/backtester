@@ -163,7 +163,7 @@ function loadDTPickChart(ticker) {
                 return;
             }
             const bars = data.bars;
-            Plotly.newPlot(el, [{
+            const traces = [{
                 x: bars.map(b => b.time),
                 open: bars.map(b => b.open),
                 high: bars.map(b => b.high),
@@ -172,7 +172,29 @@ function loadDTPickChart(ticker) {
                 type: 'candlestick',
                 increasing: { line: { color: '#16a34a' }, fillcolor: '#bbf7d0' },
                 decreasing: { line: { color: '#dc2626' }, fillcolor: '#fecaca' },
-            }], {
+            }];
+            for (const p of (data.predictions || []).slice(0, 15).reverse()) {
+                const color = p.status === 'pending' ? '#7c3aed' : p.hit ? '#16a34a' : '#dc2626';
+                traces.push({
+                    x: [p.input_at, p.target_at],
+                    y: [p.base_price, p.predicted_price],
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Prediction',
+                    line: { color, dash: 'dash' },
+                });
+                if (p.actual_price) {
+                    traces.push({
+                        x: [p.actual_at],
+                        y: [p.actual_price],
+                        type: 'scatter',
+                        mode: 'markers',
+                        name: p.hit ? 'Actual hit' : 'Actual miss',
+                        marker: { color, size: 9, symbol: p.hit ? 'star' : 'x' },
+                    });
+                }
+            }
+            Plotly.newPlot(el, traces, {
                 margin: { t: 5, r: 30, b: 30, l: 50 },
                 xaxis: { type: 'date', rangeslider: { visible: false } },
                 yaxis: { title: 'Price' },
@@ -204,9 +226,9 @@ function loadDTPickPrediction(ticker) {
             el.innerHTML = `
                 <div class="dt-pred-row ${isUp ? 'up' : 'down'}">
                     <span class="dt-pred-dir">${isUp ? '&#9650;' : '&#9660;'} ${data.direction}</span>
-                    <span class="dt-pred-ret">${data.predicted_return}%</span>
+                    <span class="dt-pred-ret">$${Number(data.predicted_price).toFixed(2)} (${data.predicted_return}%)</span>
                     <span class="dt-pred-conf">Conf: ${data.confidence}%</span>
-                    <span class="dt-pred-horizon">Next ${data.horizon_bars} × ${data.interval}</span>
+                    <span class="dt-pred-horizon">For ${new Date(data.target_at).toLocaleString()} | Made ${new Date(data.created_at).toLocaleString()} | Accuracy ${data.forward_accuracy == null ? 'awaiting outcomes' : `${data.forward_accuracy}%`}</span>
                 </div>`;
         })
         .catch(() => {

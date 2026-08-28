@@ -1,199 +1,302 @@
-# ML Stock Predictor — Documentation
+# Machine Learning Guide
 
-## Overview
+The application has three prediction families that share one durable lifecycle:
 
-The ML module uses an **ensemble model** (Random Forest + HistGradientBoosting + Neural Network) with **120+ features** including cross-asset context (SPY, VIX, sector ETFs, treasuries, credit spreads) to predict whether a stock will go UP or DOWN over configurable horizons.
+- `StockPredictor`: the default daily direction and target-price model.
+- `HorizonModel`: real-time 5-minute, intraday, 1-day, 5-day, 20-day,
+  60-day, and 252-day models.
+- `CombinedPredictor`: quantitative, news-sentiment, and alternative-data model.
 
-## Quick Start
+Every live prediction records when it was made, the market data it used, when its
+forecast is due, its target price, the eventual observed price, and whether the
+directional forecast was correct. All timestamps are stored as UTC ISO-8601.
+
+## Install
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# 1. Train the default model (uses ~70 tickers across all sectors)
-python main.py --mode ml-train
-
-# 2. Get a prediction
-python main.py --mode ml-predict -t TSLA AAPL
-
-# 3. Run walk-forward backtest (no future data leakage)
-python main.py --mode ml-backtest
-
-# 4. Run 24/7 headless analysis
-python main.py --mode ml-headless --interval 3600 --output predictions.csv
-
-# 5. Train multi-horizon models (intraday through 1-year)
-python main.py --mode ml-horizons-train --horizon short_1d short_5d medium_20d long_60d
-
-# 6. Backtest multi-horizon models
-python main.py --mode ml-horizons-backtest --horizon short_5d medium_20d
-
-# 7. Run accuracy optimization loop
-python -m ml.optimize_loop --horizon 5 --target 0.70 --rounds 3
 ```
 
-## Architecture
-
-```
-ml/
-├── features.py        # Feature engineering (120+ indicators + cross-asset)
-├── model.py           # StockPredictor ensemble model
-├── multi_horizon.py   # Multi-horizon model system (1d through 252d)
-├── optimize_loop.py   # Automated accuracy optimization
-├── backtest.py        # Walk-forward backtesting (no future leakage)
-├── headless.py        # 24/7 continuous analysis daemon
-└── models/            # Saved model files (.pkl)
-```
-
-### Multi-Horizon Models
-
-| Horizon | Name | Use Case | Interval |
-|---------|------|----------|----------|
-| Intraday | `intraday` | Day trading | 5-minute bars |
-| 1 day | `short_1d` | Overnight swing trades | Daily |
-| 5 days | `short_5d` | Weekly swing trades | Daily |
-| 20 days | `medium_20d` | Monthly position trades | Daily |
-| 60 days | `long_60d` | Quarterly positions | Daily |
-| 252 days | `long_252d` | Annual investment decisions | Weekly |
-
-### Features (120+)
-
-- **Returns**: Multi-period (1d through 20d) percentage changes
-- **Moving Averages**: SMA & EMA (5, 10, 20, 50, 200), distance ratios, crossover signals
-- **Volatility**: Multi-period rolling std, Parkinson volatility, volatility ratios
-- **RSI**: Multi-period (7, 14, 21) with divergence detection
-- **MACD**: Line, signal, histogram, crossover detection
-- **Bollinger Bands**: Multi-period (20, 50), position within bands
-- **Volume**: SMA, ratio, OBV, OBV slope, volume-price trend
-- **ATR**: 14-period average true range, ATR/price ratio
-- **Stochastic**: %K and %D oscillators
-- **Calendar**: Day of week, month, quarter, month start/end
-- **Streak**: Consecutive up/down day counts
-- **Lag**: 1-5 day lagged returns and volume ratios
-- **Statistical**: Skewness, kurtosis over rolling windows
-- **Feature Interactions**: RSI × volume, momentum × volatility, SMA spread × RSI
-
-#### Cross-Asset Context Features
-
-| Data Source | Features Added |
-|-------------|---------------|
-| SPY (S&P 500) | 1d/5d/20d returns, SMA ratio |
-| ^VIX (Volatility) | Level, 10d SMA, change, 1d/5d/20d returns |
-| QQQ (Nasdaq 100) | 1d/5d/20d returns, SMA ratio |
-| IWM (Russell 2000) | 1d/5d/20d returns, SMA ratio |
-| TLT (20yr Treasury) | 1d/5d/20d returns, SMA ratio |
-| GLD (Gold) | 1d/5d/20d returns, SMA ratio |
-| UUP (US Dollar) | 1d/5d/20d returns, SMA ratio |
-| HYG (High Yield) | 1d/5d/20d returns, SMA ratio |
-| Sector ETFs (XLK, XLF, etc.) | Relative strength, sector returns |
-| Market breadth | Risk-on/off (tech vs utilities) |
-| Credit spread | HYG vs TLT momentum |
-
-## Tested Accuracy Results
-
-### Walk-Forward Backtest (Temporal — Honest Results)
-
-The gold-standard test: train on PAST data only, predict FUTURE unseen data.
-Uses rolling retraining (2-year window, quarterly steps) across 70 tickers.
-
-| Horizon | Overall Accuracy | High-Confidence (>75%) |
-|---------|-----------------|------------------------|
-| 1 day | 50.3% | 56.6% (2% of preds) |
-| 5 days | 50.8% | 57.8% (8% of preds) |
-| 20 days | 52.0% | 52.3% (17% of preds) |
-| 60 days | 52.8% | 53.9% (31% of preds) |
-
-### Cross-Sectional Holdout (Train on some tickers, test on others)
-
-Train on 54 tickers, test on 15 held-out tickers (same time period).
-Tests generalization to unseen stocks within the same market regime.
-
-| Horizon | Accuracy |
-|---------|----------|
-| 1 day | 67.3% |
-| 5 days | 66.6% |
-| 20 days | 65.6% |
-| 60 days | 66.4% |
-
-### Cross-Validation (Within Training Data)
-
-| Horizon | CV Accuracy |
-|---------|-------------|
-| 1 day | 62.4% ± 2.9% |
-| 5 days | 60.9% ± 3.2% |
-| 20 days | 61.2% ± 4.4% |
-| 60 days | 60.4% ± 7.3% |
-
-### Why Temporal Walk-Forward Is Lower
-
-The temporal test is the most realistic but hardest:
-- **Market regimes change**: Patterns from 2019-2022 may not predict 2023-2025
-- **EMH applies**: Markets are approximately efficient — consistent prediction is hard
-- **No alternative data**: Free technical indicators are already priced in by most participants
-- **Cross-sectional scores are inflated**: Training and test data share the same macro environment
-
-## How to Improve Accuracy
-
-### What Won't Help (Diminishing Returns)
-- More trees / deeper models — accuracy plateaus around 60% CV
-- More technical indicators — already exhaustive (120+)
-- Feature selection — top features are cross-asset, which are essential
-
-### What WOULD Help (Requires Investment)
-
-| Data Source | Expected Improvement | Cost |
-|-------------|---------------------|------|
-| **News Sentiment** (Refinitiv, Bloomberg) | +3-5% | $$$$ |
-| **Social Sentiment** (StockTwits, Reddit NLP) | +2-4% | $-$$ |
-| **Fundamental Data** (Earnings, analyst revisions) | +3-5% | $-$$ |
-| **Options Flow** (Put/call ratios, IV surfaces) | +2-3% | $$$ |
-| **Alternative Data** (Satellite, web traffic) | +1-3% | $$$$ |
-| **Insider Trading** (SEC EDGAR filings) | +1-2% | Free (parsing effort) |
-
-### Practical Strategies
-
-1. **Confidence Filtering**: Only act on high-confidence predictions (>65%)
-2. **Sector-Specific Models**: Train per-sector for tighter patterns
-3. **Regime Detection**: Use VIX levels to switch between bull/bear models
-4. **Ensemble of Horizons**: Combine signals across timeframes
-5. **Rolling Retraining**: Update model weekly with most recent data
-
-## Preventing Overfitting
-
-### Built-in Safeguards
-
-1. **Time-Series Cross-Validation**: Uses `TimeSeriesSplit` — never trains on future data
-2. **Walk-Forward Backtesting**: Expanding window simulating real deployment
-3. **Regularization**: `min_samples_leaf=30`, `max_depth` limits, `l2_regularization`
-4. **Early Stopping**: HistGBM and MLP both use early stopping
-5. **Rolling Retraining**: 2-year window prevents memorizing ancient patterns
-6. **Broad Training Data**: 70+ tickers across all sectors
-
-### Signs of Overfitting
-
-| Symptom | Solution |
-|---------|----------|
-| CV accuracy >> walk-forward accuracy | Reduce `max_depth`, increase regularization |
-| CV accuracy > 65% | Very suspicious — check for data leakage |
-| One feature dominates importance | Remove or cap that feature |
-| Model performs perfectly in one regime | Test across multiple market conditions |
-
-## Headless / 24/7 Mode
+Optional NVIDIA CUDA acceleration uses XGBoost:
 
 ```bash
-# Default: analyze 65 stocks every hour
-python main.py --mode ml-headless
-
-# Custom tickers, 5-minute intervals, save to CSV
-python main.py --mode ml-headless --tickers AAPL TSLA NVDA --interval 300 --output predictions.csv
+pip install -r requirements-gpu.txt
 ```
 
-## Important Disclaimers
+GPU estimators are selected only when XGBoost and an NVIDIA GPU are both
+available. Set `ML_ACCELERATOR=cpu` to force CPU estimators. Set
+`ML_IO_WORKERS` to override the bounded worker count used for independent data
+downloads and predictions.
 
-⚠️ **This is for educational/research purposes only.**
+## Run the complete system
 
-- Stock markets are approximately efficient — consistent 70%+ accuracy requires alternative data
-- The temporal walk-forward results (50-53%) reflect realistic production expectations
-- Higher cross-sectional scores (66-67%) reflect the model's ability to distinguish stocks within a market regime
-- Never invest money you can't afford to lose based on model output
-- Past performance does not guarantee future results
+Start the FastAPI web application and the coordinated collection, prediction,
+settlement, and retraining service:
+
+```bash
+python run_server.py
+```
+
+Open `http://localhost:8000`.
+
+Useful options:
+
+```bash
+python run_server.py --port 8080
+python run_server.py --predict-interval 30 --retrain-hours 6
+python run_server.py --target-accuracy 0.70 --minimum-accuracy 0.65
+python run_server.py --minimum-outcomes 50
+python run_server.py --no-scraper
+python run_server.py --no-predictions
+python run_server.py --no-retrain
+```
+
+The continuous service keeps running after reaching the configured threshold so
+that new public information is collected, due forecasts are settled, drift is
+measured, and all model families continue to be refreshed.
+
+Run the continuous pipeline without the web server:
+
+```bash
+python main.py --mode ml-continuous
+python main.py --mode ml-continuous --interval 1800 --retrain-hours 6
+python main.py --mode ml-continuous --target-accuracy 0.70 --minimum-accuracy 0.65 --minimum-outcomes 30
+```
+
+## Prediction lifecycle
+
+`ml/prediction_store.py` is the source of truth for model registrations,
+training times, predictions, settlements, and accuracy.
+
+Each persisted prediction includes:
+
+| Field | Meaning |
+|---|---|
+| Model and training version | Identifies the model family and exact training run |
+| Ticker | Predicted security |
+| `created_at` | When the prediction was generated |
+| `input_time` | Timestamp of the newest market bar available to the model |
+| `target_time` | When the advertised forecast is expected to be true |
+| Interval and horizon | Forecast cadence and number of bars |
+| Base price | Price known when the forecast was made |
+| Predicted return and target price | Forecast magnitude |
+| Direction and confidence | `UP`, `DOWN`, or `FLAT` and model probability |
+| Actual price and observation time | First eligible market observation at or after the target |
+| Status and hit | Pending/settled state and directional result |
+
+Daily and intraday targets use the XNYS exchange calendar, including holidays
+and early closes. The advertised target is the time when the complete target
+bar becomes observable, not the bar's opening timestamp. A forecast is not
+scored until that completion time passes and an eligible completed market bar
+exists. Intraday models do not issue forecasts when their horizon would cross
+the current session boundary, matching their session-grouped training labels.
+
+The directional rule is:
+
+- `UP` is a hit when the actual price is at or above the predicted target price.
+- `DOWN` is a hit when the actual price is at or below the predicted target price.
+- `FLAT` is a hit when the actual price is within 0.25% of the target price.
+
+Accuracy is the mean hit rate over settled forecasts only. Pending predictions
+never enter the denominator. Retraining creates a new model version, so a new
+forecast from the same market bar is retained rather than overwriting an older
+model's forecast.
+
+By default, lifecycle data is stored in
+`ml/models/prediction_history.db`. Set `PREDICTION_DB_PATH` to override it.
+
+## Web views and APIs
+
+The stock detail page shows every available model family. Prediction cards
+include creation time, input time, target time, target price, last training
+time, settled sample count, and live directional accuracy.
+
+Daily and intraday charts overlay:
+
+- the price known when the model predicted;
+- the model's target price at the advertised target time; and
+- the eventual actual price after the outcome becomes observable.
+
+Prediction history remains available after settlement and identifies pending,
+hit, and miss outcomes.
+
+Relevant endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/stock/{ticker}/predictions` | Current predictions from all model families |
+| `GET /api/predictions/history` | Filterable durable prediction history |
+| `POST /api/predictions/settle` | Settle all currently due outcomes |
+| `GET /api/models/status` | Training timestamps and live forward statistics |
+| `GET /api/stock/{ticker}/intraday` | Intraday bars and prediction overlays |
+
+The dashboard, market-wide screen, watchlist, stock-detail page, and ML control
+screen use the same lifecycle data rather than independent accuracy claims.
+
+## Accuracy: production gate versus research diagnostics
+
+The production target is measured only from genuine prospective forecasts:
+
+1. The model persists a prediction before its result exists.
+2. The advertised target time passes.
+3. The settlement process obtains the first eligible market price.
+4. The ledger applies the directional hit rule.
+5. `ContinuousTrainingService` evaluates the settled outcomes.
+
+The default target is 70%. The configured fallback floor is 65%, and the score
+is not accepted until at least `--minimum-outcomes` forecasts have settled.
+Service state is persisted so restarts do not reset progress.
+
+Training CV and historical backtests remain useful diagnostics, but neither can
+satisfy the live production gate. In particular:
+
+- `ml-train` reports temporal cross-validation.
+- `ml-backtest` and `ml-horizons-backtest` report historical simulations.
+- `ml/optimize_loop.py` compares temporal CV and unseen-ticker holdouts for
+  offline model selection; its holdout score is not live future accuracy.
+
+The `realtime_5m` model uses an untouched final two-trading-day holdout and the
+same target-price settlement rule as production. It predicts `UP` or `DOWN`
+only for moves of at least 0.25%; smaller moves are explicitly `FLAT`, with the
+same 0.25% tolerance used by the ledger. Intraday training targets are grouped
+by market session so they never cross an overnight or weekend boundary.
+
+The web application labels these metrics separately and uses only settled
+prediction-ledger outcomes for the live accuracy statistic.
+
+## Data and point-in-time safety
+
+`ml/alternative_data.py` collects public observations into
+`ml/models/alternative_data.db`. Supported sources include:
+
+- CNBC, MarketWatch, Reuters, and configurable RSS news;
+- SEC submissions, filing metadata, and Form 4 insider transactions;
+- configurable congressional transaction feeds;
+- configurable executive or presidential public RSS feeds;
+- USGS earthquake reports;
+- NASA EONET natural-disaster reports;
+- GDELT geopolitical events;
+- yfinance news, fundamentals, earnings, and options; and
+- arbitrary standardized JSON feeds.
+
+These features are joined centrally in `compute_features()` and
+`compute_intraday_features()`, so the default, horizon, combined, optimization,
+and backtest paths receive the same fixed alternative-data schema.
+
+Every observation has:
+
+- `event_time`: when the event happened;
+- `available_at`: when the public source made it available; and
+- `collected_at`: when this process retrieved it.
+
+A historical feature query includes an observation only when both
+`event_time <= as_of` and `available_at <= as_of`. This prevents future
+information from leaking into an earlier training row. Ticker queries include
+that ticker and global events, but never observations belonging only to another
+ticker.
+
+Fresh installations have sparse historical alternative-data coverage. The
+fixed schema supplies zero-valued features before eligible observations exist,
+then fills naturally as the permanent collector accumulates point-in-time data.
+
+### Alternative-data configuration
+
+| Variable | Purpose |
+|---|---|
+| `ALT_DATA_DB_PATH` | Override the SQLite database path |
+| `ALT_DATA_HTTP_TIMEOUT_SECONDS` | HTTP timeout for collectors |
+| `ALT_DATA_SEC_USER_AGENT` | Truthful SEC user agent with contact information |
+| `ALT_DATA_SEC_RATE_LIMIT_SECONDS` | Delay between SEC requests |
+| `ALT_DATA_SEC_MAX_FILINGS_PER_TICKER` | Filing records collected per ticker |
+| `ALT_DATA_SEC_MAX_FORM4_DOCUMENTS` | Form 4 documents parsed per ticker |
+| `ALT_DATA_NEWS_RSS_FEEDS` | Additional news RSS URLs |
+| `ALT_DATA_EXECUTIVE_RSS_FEEDS` | Public executive/presidential RSS URLs |
+| `ALT_DATA_CONGRESSIONAL_ENDPOINTS` | Congressional transaction endpoints |
+| `ALT_DATA_CUSTOM_JSON_FEEDS` | Standardized custom JSON endpoints |
+| `ALT_DATA_ENABLE_USGS` | Enable or disable USGS collection |
+| `ALT_DATA_ENABLE_EONET` | Enable or disable NASA EONET collection |
+| `ALT_DATA_ENABLE_GDELT` | Enable or disable GDELT collection |
+
+Feed variables accept a JSON object mapping source names to URLs, a JSON list of
+URLs, or comma-separated URLs. Sources without a stable official
+unauthenticated API remain opt-in rather than being scraped through brittle or
+unauthorized paths.
+
+## Features
+
+The common feature pipeline includes:
+
+- Multi-window returns, volatility, volume, and momentum.
+- SMA/EMA distances, RSI, MACD, Bollinger bands, ATR, stochastic oscillators,
+  OBV, VWAP, and calendar signals.
+- ADX, CCI, MFI, Chaikin money flow, Williams %R, Donchian and Keltner
+  channels, Ichimoku values, drawdown, downside volatility, autocorrelation,
+  and price-volume correlation.
+- Market breadth, yield-curve context, commodities, cryptocurrencies,
+  beta/correlation, VIX, sector ETFs, bonds, and the US dollar.
+- Point-in-time news, filings, insider transactions, public-official trading,
+  disasters, geopolitical events, fundamentals, earnings, and options.
+- Sentiment from article headlines, Fear & Greed data, and ticker-specific
+  news for the combined model.
+
+Feature selection, scaling, and estimators are fitted only from the appropriate
+training partition. Training samples are globally time ordered before temporal
+splits.
+
+## Model commands
+
+Train and save the default model:
+
+```bash
+python main.py --mode ml-train
+python main.py --mode ml-train --tickers AAPL MSFT NVDA --timeline 5y
+```
+
+Load it and create persisted live predictions:
+
+```bash
+python main.py --mode ml-predict --tickers AAPL MSFT
+```
+
+Run historical evaluation:
+
+```bash
+python main.py --mode ml-backtest
+python main.py --mode ml-horizons-backtest
+```
+
+Train all horizon models:
+
+```bash
+python main.py --mode ml-horizons-train
+python main.py --mode ml-horizons-train --horizon realtime_5m intraday short_1d short_5d medium_20d long_60d long_252d
+```
+
+Run the default model as a standalone prediction daemon:
+
+```bash
+python main.py --mode ml-headless --tickers AAPL MSFT --interval 3600
+```
+
+## Storage
+
+Generated runtime artifacts live under `ml/models/`:
+
+| Path | Contents |
+|---|---|
+| `ml/models/prediction_history.db` | Model registrations, immutable predictions, outcomes, and accuracy |
+| `ml/models/alternative_data.db` | Point-in-time public observations and source health |
+| `ml/models/continuous_training_state.json` | Continuous-service progress and gate state |
+| `ml/models/stock_predictor.pkl` | Default trained model |
+| `ml/models/model_*.pkl` | Multi-horizon trained models |
+| `ml/models/combined_model.pkl` | Combined model |
+
+Do not commit generated databases or model artifacts.
+
+## Important use note
+
+Predictions are probabilistic research outputs, not financial advice. A 70%
+live directional target is a measured operating goal, not a guarantee for any
+individual trade. The durable ledger makes the result auditable and prevents
+pending, backfilled, CV, or historical outcomes from being reported as future
+production performance.

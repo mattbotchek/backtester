@@ -30,28 +30,14 @@
     </section>
 
     <section class="card">
-        <h2>Accuracy Results</h2>
-        <h3>Walk-Forward Backtest (Temporal — Honest Results)</h3>
-        <table class="data-table">
-            <thead><tr><th>Horizon</th><th>Overall</th><th>High Confidence (&gt;75%)</th><th>Method</th></tr></thead>
-            <tbody>
-                <tr><td>1 day</td><td>50.3%</td><td>56.6% (2% of preds)</td><td>Rolling retrain</td></tr>
-                <tr><td>5 days</td><td>50.8%</td><td>57.8% (8% of preds)</td><td>Rolling retrain</td></tr>
-                <tr><td>20 days</td><td>52.0%</td><td>52.3% (17% of preds)</td><td>Rolling retrain</td></tr>
-                <tr><td>60 days</td><td>52.8%</td><td>53.9% (31% of preds)</td><td>Rolling retrain</td></tr>
-            </tbody>
-        </table>
+        <h2>Live Forward Accuracy</h2>
+        <p class="subtitle">Only predictions made before the outcome existed count. A hit means actual price reached or exceeded an UP target, or reached or fell below a DOWN target.</p>
+        <div id="live-accuracy"><div class="loading">Loading model accuracy...</div></div>
+    </section>
 
-        <h3>Cross-Sectional Holdout</h3>
-        <table class="data-table">
-            <thead><tr><th>Horizon</th><th>Accuracy</th><th>Method</th></tr></thead>
-            <tbody>
-                <tr><td>1 day</td><td>67.3%</td><td>Unseen tickers, same period</td></tr>
-                <tr><td>5 days</td><td>66.6%</td><td>Unseen tickers, same period</td></tr>
-                <tr><td>20 days</td><td>65.6%</td><td>Unseen tickers, same period</td></tr>
-                <tr><td>60 days</td><td>66.4%</td><td>Unseen tickers, same period</td></tr>
-            </tbody>
-        </table>
+    <section class="card">
+        <h2>Recent Prediction Outcomes</h2>
+        <div id="model-history"><div class="loading">Loading prediction history...</div></div>
     </section>
 
     <section class="card">
@@ -70,16 +56,16 @@
                 <code>python main.py --mode ml-backtest</code>
             </div>
             <div class="command-item">
-                <h4>Run Accuracy Optimization Loop</h4>
+                <h4>Run Offline Model Tuning</h4>
                 <code>python -m ml.optimize_loop --horizon 5 --target 0.65 --rounds 3</code>
             </div>
             <div class="command-item">
-                <h4>Run 24/7 Headless Prediction</h4>
-                <code>python main.py --mode ml-headless --interval 3600 --output predictions.csv</code>
+                <h4>Run Continuous Future Evaluation</h4>
+                <code>python main.py --mode ml-continuous --target-accuracy 0.70 --minimum-accuracy 0.65</code>
             </div>
             <div class="command-item">
-                <h4>Start Web Server (24/7)</h4>
-                <code>python -m webapp.app</code>
+                <h4>Start Complete 24/7 System</h4>
+                <code>python run_server.py</code>
             </div>
         </div>
     </section>
@@ -90,19 +76,76 @@
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const panel = document.getElementById('model-status');
-    // Check for saved models
-    fetch('/api/stock/AAPL/prediction')
+    fetch('/api/models/status')
         .then(r => r.json())
         .then(data => {
-            const p = data.prediction || {};
-            if (p.direction === 'N/A') {
+            const models = data.models || [];
+            const accuracyPanel = document.getElementById('live-accuracy');
+            if (!models.length) {
                 panel.innerHTML = `<div class="status-warning">No trained model found. Run: <code>python main.py --mode ml-train</code></div>`;
-            } else {
-                panel.innerHTML = `<div class="status-ok">Model loaded. Test prediction for AAPL: ${p.direction} (${p.confidence}% confidence)</div>`;
+                accuracyPanel.innerHTML = '<div class="muted">Accuracy begins accumulating after predictions reach their target time.</div>';
+                return;
             }
+            panel.innerHTML = `<div class="status-ok">${models.length} model${models.length === 1 ? '' : 's'} registered and tracking forward outcomes.</div>`;
+            let html = `<div class="table-scroll"><table class="data-table"><thead><tr>
+                <th>Model</th><th>Family</th><th>Horizon</th><th>Last Trained</th>
+                <th>Predictions</th><th>Pending</th><th>Hits</th><th>Forward Accuracy</th><th>Goal</th><th>Compute</th>
+            </tr></thead><tbody>`;
+            for (const model of models) {
+                const accuracy = model.forward_accuracy == null
+                    ? 'Awaiting outcomes'
+                    : `${(model.forward_accuracy * 100).toFixed(1)}%`;
+                const goalMet = model.forward_accuracy != null && model.forward_accuracy >= model.target_accuracy;
+                html += `<tr>
+                    <td>${model.model_name}</td>
+                    <td>${model.family}</td>
+                    <td>${model.horizon} × ${model.interval}</td>
+                    <td>${model.last_trained_at ? new Date(model.last_trained_at).toLocaleString() : '—'}</td>
+                    <td>${model.prediction_count}</td>
+                    <td>${model.pending_count}</td>
+                    <td>${model.hit_count} / ${model.settled_count}</td>
+                    <td class="${goalMet ? 'up' : ''}">${accuracy}</td>
+                    <td>${(model.target_accuracy * 100).toFixed(0)}% target / ${(model.minimum_accuracy * 100).toFixed(0)}% floor</td>
+                    <td>${model.training_metrics.compute_backend || '—'}</td>
+                </tr>`;
+            }
+            accuracyPanel.innerHTML = html + '</tbody></table></div>';
         })
         .catch(() => {
             panel.innerHTML = `<div class="status-warning">Model not available. Train it first.</div>`;
+        });
+
+    fetch('/api/predictions/history?limit=100')
+        .then(r => r.json())
+        .then(data => {
+            const history = data.predictions || [];
+            const historyPanel = document.getElementById('model-history');
+            if (!history.length) {
+                historyPanel.innerHTML = '<div class="muted">No prediction history yet.</div>';
+                return;
+            }
+            let html = `<div class="table-scroll"><table class="data-table"><thead><tr>
+                <th>Model</th><th>Ticker</th><th>Made</th><th>Target</th><th>Call</th>
+                <th>Predicted Price</th><th>Actual Price</th><th>Outcome</th>
+            </tr></thead><tbody>`;
+            for (const p of history) {
+                const outcome = p.status === 'pending' ? 'PENDING' : p.hit ? 'HIT' : 'MISS';
+                const badge = p.status === 'pending' ? 'pending' : p.hit ? 'hit' : 'miss';
+                html += `<tr>
+                    <td>${p.model_name}</td>
+                    <td><a href="/stock/${p.ticker}">${p.ticker}</a></td>
+                    <td>${new Date(p.created_at).toLocaleString()}</td>
+                    <td>${new Date(p.target_at).toLocaleString()}</td>
+                    <td class="${p.direction === 'UP' ? 'up' : 'down'}">${p.direction}</td>
+                    <td>$${Number(p.predicted_price).toFixed(2)}</td>
+                    <td>${p.actual_price ? `$${Number(p.actual_price).toFixed(2)} at ${new Date(p.actual_at).toLocaleString()}` : 'Awaiting target'}</td>
+                    <td><span class="badge ${badge}">${outcome}</span></td>
+                </tr>`;
+            }
+            historyPanel.innerHTML = html + '</tbody></table></div>';
+        })
+        .catch(() => {
+            document.getElementById('model-history').innerHTML = '<div class="muted">History unavailable.</div>';
         });
 });
 </script>

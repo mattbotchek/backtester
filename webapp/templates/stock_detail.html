@@ -27,12 +27,20 @@
         <div id="price-chart" style="height: 400px;"></div>
     </section>
 
-    <!-- ML Prediction -->
+    <!-- ML Predictions -->
     <section class="card">
-        <h2>ML Prediction</h2>
+        <h2>ML Predictions</h2>
+        <p class="subtitle">Each model is scored only after its target time using the realized market price.</p>
         <div id="training-progress"></div>
-        <div id="prediction-panel">
-            <div class="loading">Loading prediction...</div>
+        <div id="prediction-panel" class="model-predictions-grid">
+            <div class="loading">Loading predictions...</div>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Prediction History</h2>
+        <div id="prediction-history-panel">
+            <div class="loading">Loading prediction history...</div>
         </div>
     </section>
 
@@ -97,6 +105,136 @@
 {% block scripts %}
 <script>
 const TICKER = '{{ ticker }}';
+let stockPriceHistory = null;
+let predictionHistory = [];
+
+function formatTimestamp(value) {
+    if (!value) return '—';
+    return new Date(value).toLocaleString();
+}
+
+function renderPriceChart() {
+    if (!stockPriceHistory) return;
+    const traces = [{
+        x: stockPriceHistory.dates,
+        y: stockPriceHistory.close,
+        type: 'scatter',
+        mode: 'lines',
+        name: 'Actual close',
+        line: { color: '#2563eb', width: 2 },
+    }];
+
+    const overlays = predictionHistory
+        .filter(p => p.base_price && p.predicted_price)
+        .slice(0, 40)
+        .reverse();
+
+    for (const p of overlays) {
+        const color = p.status === 'pending' ? '#7c3aed' : p.hit ? '#16a34a' : '#dc2626';
+        traces.push({
+            x: [p.input_at, p.target_at],
+            y: [p.base_price, p.predicted_price],
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: `${p.model_name} prediction`,
+            legendgroup: p.model_name,
+            line: { color, width: 1.5, dash: 'dash' },
+            marker: { size: 7, symbol: ['circle', 'diamond'] },
+            hovertemplate:
+                `<b>${p.model_name}</b><br>` +
+                `Made: ${formatTimestamp(p.created_at)}<br>` +
+                `Target: ${formatTimestamp(p.target_at)}<br>` +
+                `Predicted: $${Number(p.predicted_price).toFixed(2)}<extra></extra>`,
+        });
+        if (p.actual_price) {
+            traces.push({
+                x: [p.input_at, p.actual_at],
+                y: [p.base_price, p.actual_price],
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: `${p.model_name} realized`,
+                legendgroup: p.model_name,
+                showlegend: false,
+                line: { color, width: 2 },
+                marker: { size: 7, symbol: ['circle', p.hit ? 'star' : 'x'] },
+                hovertemplate:
+                    `<b>${p.model_name} actual</b><br>` +
+                    `Observed: ${formatTimestamp(p.actual_at)}<br>` +
+                    `Actual: $${Number(p.actual_price).toFixed(2)}<br>` +
+                    `Result: ${p.hit ? 'HIT' : 'MISS'}<extra></extra>`,
+            });
+        }
+    }
+
+    Plotly.newPlot('price-chart', traces, {
+        margin: { t: 10, r: 30, b: 40, l: 60 },
+        xaxis: { type: 'date' },
+        yaxis: { title: 'Price ($)' },
+        plot_bgcolor: '#fafafa',
+        paper_bgcolor: 'transparent',
+        font: { family: 'system-ui' },
+        legend: { orientation: 'h', y: -0.2 },
+        hovermode: 'x unified',
+    }, { responsive: true });
+}
+
+function renderPredictionHistory(history) {
+    const panel = document.getElementById('prediction-history-panel');
+    if (!history.length) {
+        panel.innerHTML = '<div class="muted">No predictions have been recorded yet.</div>';
+        return;
+    }
+    let html = `<div class="table-scroll"><table class="data-table">
+        <thead><tr>
+            <th>Model</th><th>Made</th><th>Target time</th><th>Call</th>
+            <th>Start</th><th>Predicted</th><th>Actual at target</th><th>Result</th>
+        </tr></thead><tbody>`;
+    for (const p of history) {
+        const result = p.status === 'pending'
+            ? '<span class="badge pending">PENDING</span>'
+            : `<span class="badge ${p.hit ? 'hit' : 'miss'}">${p.hit ? 'HIT' : 'MISS'}</span>`;
+        html += `<tr>
+            <td>${p.model_name}</td>
+            <td>${formatTimestamp(p.created_at)}</td>
+            <td>${formatTimestamp(p.target_at)}</td>
+            <td class="${p.direction === 'UP' ? 'up' : 'down'}">${p.direction} (${Number(p.confidence * 100).toFixed(1)}%)</td>
+            <td>$${Number(p.base_price).toFixed(2)}</td>
+            <td>$${Number(p.predicted_price).toFixed(2)}</td>
+            <td>${p.actual_price ? `$${Number(p.actual_price).toFixed(2)}<br><span class="muted">${formatTimestamp(p.actual_at)}</span>` : 'Awaiting target'}</td>
+            <td>${result}</td>
+        </tr>`;
+    }
+    panel.innerHTML = html + '</tbody></table></div>';
+}
+
+function renderModelPredictions(predictions, errors) {
+    const panel = document.getElementById('prediction-panel');
+    if (!predictions.length) {
+        panel.innerHTML = '<div class="muted">No trained model is available yet.</div>';
+        return;
+    }
+    panel.innerHTML = predictions.map(p => {
+        const isUp = p.direction === 'UP';
+        const accuracy = p.forward_accuracy == null
+            ? 'Awaiting realized predictions'
+            : `${Number(p.forward_accuracy).toFixed(1)}% (${p.settled_predictions} settled)`;
+        return `<article class="prediction-card prediction-card-stacked ${isUp ? 'up' : 'down'}">
+            <div class="prediction-card-header">
+                <strong>${p.model_name}</strong>
+                <span class="pred-direction">${isUp ? '&#9650;' : '&#9660;'} ${p.direction}</span>
+            </div>
+            <div class="pred-price">$${Number(p.predicted_price).toFixed(2)}</div>
+            <div class="pred-return">${Number(p.predicted_return).toFixed(2)}%</div>
+            <dl class="prediction-meta">
+                <div><dt>Confidence</dt><dd>${Number(p.confidence).toFixed(1)}%</dd></div>
+                <div><dt>Prediction made</dt><dd>${formatTimestamp(p.created_at)}</dd></div>
+                <div><dt>Predicted for</dt><dd>${formatTimestamp(p.target_at)}</dd></div>
+                <div><dt>Forward accuracy</dt><dd>${accuracy}</dd></div>
+                <div><dt>Last trained</dt><dd>${formatTimestamp(p.last_trained_at)}</dd></div>
+            </dl>
+        </article>`;
+    }).join('');
+}
 
 // ── Picks persistence (localStorage) ──
 function getPicks() {
@@ -175,7 +313,32 @@ function loadDayTrading() {
                 showlegend: false,
             };
 
-            Plotly.newPlot(chart, [trace, volumeTrace], {
+            const traces = [trace, volumeTrace];
+            for (const p of (data.predictions || []).slice(0, 20).reverse()) {
+                const color = p.status === 'pending' ? '#7c3aed' : p.hit ? '#16a34a' : '#dc2626';
+                traces.push({
+                    x: [p.input_at, p.target_at],
+                    y: [p.base_price, p.predicted_price],
+                    type: 'scatter',
+                    mode: 'lines+markers',
+                    name: 'Model prediction',
+                    line: { color, dash: 'dash' },
+                    yaxis: 'y',
+                });
+                if (p.actual_price) {
+                    traces.push({
+                        x: [p.actual_at],
+                        y: [p.actual_price],
+                        type: 'scatter',
+                        mode: 'markers',
+                        name: p.hit ? 'Actual (hit)' : 'Actual (miss)',
+                        marker: { color, size: 10, symbol: p.hit ? 'star' : 'x' },
+                        yaxis: 'y',
+                    });
+                }
+            }
+
+            Plotly.newPlot(chart, traces, {
                 margin: { t: 10, r: 50, b: 40, l: 60 },
                 xaxis: { type: 'date', rangeslider: { visible: false } },
                 yaxis: { title: 'Price ($)', domain: [0.25, 1] },
@@ -213,8 +376,12 @@ function getDTPrediction() {
             panel.innerHTML = `
                 <div class="prediction-card ${isUp ? 'up' : 'down'}">
                     <div class="pred-direction">${isUp ? '&#9650;' : '&#9660;'} ${data.direction}</div>
-                    <div class="pred-return">${data.predicted_return}%</div>
-                    <div class="pred-confidence">Confidence: ${data.confidence}% | Next ${data.horizon_bars} bars (${data.interval})</div>
+                    <div class="pred-return">$${Number(data.predicted_price).toFixed(2)} (${data.predicted_return}%)</div>
+                    <div class="pred-confidence">
+                        Confidence: ${data.confidence}% | Target: ${formatTimestamp(data.target_at)}<br>
+                        Made: ${formatTimestamp(data.created_at)} | Last trained: ${formatTimestamp(data.last_trained_at)}<br>
+                        Forward accuracy: ${data.forward_accuracy == null ? 'Awaiting outcomes' : `${data.forward_accuracy}% (${data.settled_predictions} settled)`}
+                    </div>
                 </div>`;
         })
         .catch(() => {
@@ -239,7 +406,7 @@ function trainDTModel() {
                         const intraday = (s.models || {})['intraday'];
                         if (intraday && intraday.state === 'ready') {
                             clearInterval(pollInterval);
-                            statusPanel.innerHTML = `<div class="status-ok">Model trained! Accuracy: ${(intraday.accuracy * 100).toFixed(1)}%</div>`;
+                            statusPanel.innerHTML = `<div class="status-ok">Model trained! Training validation: ${(intraday.accuracy * 100).toFixed(1)}%</div>`;
                             getDTPrediction();
                         } else if (intraday && intraday.state === 'error') {
                             clearInterval(pollInterval);
@@ -333,23 +500,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Plot chart
             if (data.history) {
-                Plotly.newPlot('price-chart', [{
-                    x: data.history.dates,
-                    y: data.history.close,
-                    type: 'scatter',
-                    mode: 'lines',
-                    name: 'Close',
-                    line: { color: '#2563eb', width: 2 },
-                    fill: 'tozeroy',
-                    fillcolor: 'rgba(37,99,235,0.08)',
-                }], {
-                    margin: { t: 10, r: 30, b: 40, l: 60 },
-                    xaxis: { type: 'date' },
-                    yaxis: { title: 'Price ($)' },
-                    plot_bgcolor: '#fafafa',
-                    paper_bgcolor: 'transparent',
-                    font: { family: 'system-ui' },
-                }, { responsive: true });
+                stockPriceHistory = data.history;
+                renderPriceChart();
             }
         });
 
@@ -370,25 +522,18 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }).catch(() => {});
 
-    // Load prediction
-    fetch(`/api/stock/${TICKER}/prediction`)
+    // Load every trained model and its auditable history
+    fetch(`/api/stock/${TICKER}/predictions`)
         .then(r => r.json())
         .then(data => {
-            const p = data.prediction || {};
-            const panel = document.getElementById('prediction-panel');
-            const dir = p.direction || 'N/A';
-            const arrow = dir === 'UP' ? '&#9650;' : dir === 'DOWN' ? '&#9660;' : '&#9654;';
-            const color = dir === 'UP' ? 'up' : dir === 'DOWN' ? 'down' : '';
-            panel.innerHTML = `
-                <div class="prediction-card ${color}">
-                    <div class="pred-direction">${arrow} ${dir}</div>
-                    <div class="pred-return">${p.predicted_return || 0}%</div>
-                    <div class="pred-confidence">Confidence: ${p.confidence || 0}%</div>
-                    ${p.outliers && p.outliers.length ? `<div class="pred-outliers">Outliers: ${p.outliers.join(', ')}</div>` : ''}
-                </div>`;
+            predictionHistory = data.history || [];
+            renderModelPredictions(data.predictions || [], data.errors || []);
+            renderPredictionHistory(predictionHistory);
+            renderPriceChart();
         })
         .catch(() => {
-            document.getElementById('prediction-panel').innerHTML = '<div class="muted">Model not trained yet. Training starts automatically on server boot.</div>';
+            document.getElementById('prediction-panel').innerHTML = '<div class="muted">Models are not trained yet. Training starts automatically on server boot.</div>';
+            document.getElementById('prediction-history-panel').innerHTML = '<div class="muted">Prediction history unavailable.</div>';
         });
 
     // Load strategies

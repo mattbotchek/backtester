@@ -289,6 +289,43 @@ body {
 .pred-return { font-size: 1.2rem; font-weight: 600; }
 .pred-confidence { font-size: 0.9rem; color: var(--text-muted); }
 .pred-outliers { font-size: 0.85rem; color: var(--yellow); }
+.model-predictions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px;
+}
+.prediction-card-stacked {
+    display: block;
+    min-width: 0;
+}
+.prediction-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.prediction-card-header .pred-direction { font-size: 1rem; }
+.pred-price { font-size: 1.7rem; font-weight: 750; }
+.prediction-meta {
+    display: grid;
+    gap: 7px;
+    margin-top: 14px;
+    font-size: 0.82rem;
+}
+.prediction-meta div {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border-top: 1px solid rgba(100, 116, 139, 0.16);
+    padding-top: 6px;
+}
+.prediction-meta dt { color: var(--text-muted); }
+.prediction-meta dd { text-align: right; font-weight: 600; }
+.table-scroll { overflow-x: auto; }
+.badge.pending { background: #ede9fe; color: #7c3aed; }
+.badge.hit { background: var(--green-bg); color: var(--green); }
+.badge.miss { background: var(--red-bg); color: var(--red); }
 
 /* ── Badges ── */
 .badge {

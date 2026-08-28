@@ -93,7 +93,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 html += `
                     <div class="${stateClass}" style="margin-bottom:8px;">
                         <strong>${name}</strong>: ${stateLabel}
-                        ${info.accuracy ? ` — Accuracy: ${(info.accuracy * 100).toFixed(1)}%` : ''}
+                        ${info.accuracy ? ` — Training validation: ${(info.accuracy * 100).toFixed(1)}%` : ''}
                         ${info.error ? ` — ${info.error}` : ''}
                         ${info.state === 'training' ? `<div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>` : ''}
                     </div>`;
@@ -174,8 +174,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 container.innerHTML = '<div class="muted">No predictions available yet. Model is training in the background...</div>';
                 return;
             }
-            let html = `<table class="data-table">
-                <thead><tr><th>Ticker</th><th>Direction</th><th>Predicted Return</th><th>Confidence</th></tr></thead>
+            let html = `<div class="table-scroll"><table class="data-table">
+                <thead><tr><th>Ticker</th><th>Direction</th><th>Target Price</th><th>Predicted Return</th><th>Confidence</th><th>Made</th><th>Predicted For</th><th>Forward Accuracy</th><th>Last Trained</th></tr></thead>
                 <tbody>`;
             for (const [ticker, pred] of Object.entries(preds)) {
                 const dir = pred.direction || 'N/A';
@@ -183,11 +183,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 html += `<tr>
                     <td><a href="/stock/${ticker}">${ticker}</a></td>
                     <td class="${isUp ? 'up' : dir === 'DOWN' ? 'down' : ''}">${dir}</td>
+                    <td>${pred.predicted_price ? `$${Number(pred.predicted_price).toFixed(2)}` : '—'}</td>
                     <td>${pred.predicted_return || 0}%</td>
                     <td>${pred.confidence || 0}%</td>
+                    <td>${pred.created_at ? new Date(pred.created_at).toLocaleString() : '—'}</td>
+                    <td>${pred.target_at ? new Date(pred.target_at).toLocaleString() : '—'}</td>
+                    <td>${pred.forward_accuracy == null ? `Awaiting (${pred.settled_predictions || 0} settled)` : `${pred.forward_accuracy}% (${pred.settled_predictions} settled)`}</td>
+                    <td>${pred.last_trained_at ? new Date(pred.last_trained_at).toLocaleString() : '—'}</td>
                 </tr>`;
             }
-            html += '</tbody></table>';
+            html += '</tbody></table></div>';
             container.innerHTML = html;
         })
         .catch(() => {

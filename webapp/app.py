@@ -13,9 +13,11 @@ Run with: python -m webapp.app
 """
 
 import logging
+import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -30,6 +32,7 @@ from fastapi.templating import Jinja2Templates
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from strategies import get_registry
+from ml.prediction_store import PredictionStore, iso_utc, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,9 @@ training_tracker = TrainingTracker()
 # Cache for predictions
 _prediction_cache: dict = {}
 _cache_timestamp: Optional[datetime] = None
+_settlement_lock = threading.Lock()
+_last_settlement_at: Optional[datetime] = None
+_settlement_in_progress = False
 
 
 # ── Helper functions ──
@@ -225,14 +231,30 @@ def _get_ml_prediction(ticker: str) -> dict:
     try:
         from ml.model import StockPredictor
 
+        _settle_due_predictions()
         predictor = StockPredictor()
         predictor.load()
         pred = predictor.predict(ticker)
         return {
+            "model_name": pred.model_name,
             "direction": pred.direction,
             "predicted_return": round(pred.predicted_return_pct, 2),
             "confidence": round(pred.confidence * 100, 1),
             "outliers": pred.outliers,
+            "created_at": pred.timestamp,
+            "input_at": pred.input_at,
+            "target_at": pred.predicted_for,
+            "base_price": round(pred.base_price, 4),
+            "predicted_price": round(pred.predicted_price, 4),
+            "last_trained_at": pred.last_trained_at,
+            "forward_accuracy": (
+                round(pred.forward_accuracy * 100, 1)
+                if pred.forward_accuracy is not None
+                else None
+            ),
+            "settled_predictions": pred.settled_predictions,
+            "interval": "1d",
+            "horizon": predictor.horizon,
         }
     except Exception as e:
         logger.debug("Prediction failed for %s: %s", ticker, e)
@@ -241,7 +263,123 @@ def _get_ml_prediction(ticker: str) -> dict:
             "predicted_return": 0,
             "confidence": 0,
             "outliers": [],
+            "model_status": "not_available",
         }
+
+
+def _settle_due_predictions(force: bool = False) -> dict:
+    """Throttle market lookups while keeping realized outcomes current."""
+    global _last_settlement_at, _settlement_in_progress
+
+    with _settlement_lock:
+        now = utc_now()
+        if _settlement_in_progress:
+            return {"status": "in_progress"}
+        if (
+            not force
+            and _last_settlement_at
+            and now - _last_settlement_at < timedelta(minutes=5)
+        ):
+            return {"status": "throttled"}
+        _last_settlement_at = now
+        _settlement_in_progress = True
+
+    def settle() -> dict:
+        global _settlement_in_progress
+
+        try:
+            return PredictionStore().settle_due(now=now)
+        finally:
+            with _settlement_lock:
+                _settlement_in_progress = False
+
+    if force:
+        return settle()
+
+    def settle_in_background() -> None:
+        try:
+            settle()
+        except Exception:
+            logger.exception("Background prediction settlement failed")
+
+    threading.Thread(target=settle_in_background, daemon=True).start()
+    return {"status": "started"}
+
+
+def _normalize_model_prediction(prediction: dict) -> dict:
+    """Normalize model-native values to the public API representation."""
+    normalized = dict(prediction)
+    normalized["predicted_return"] = round(
+        float(normalized.get("predicted_return", 0)),
+        3,
+    )
+    normalized["confidence"] = round(
+        float(normalized.get("confidence", 0)) * 100,
+        1,
+    )
+    if normalized.get("forward_accuracy") is not None:
+        normalized["forward_accuracy"] = round(
+            float(normalized["forward_accuracy"]) * 100,
+            1,
+        )
+    for field in ("base_price", "predicted_price"):
+        if normalized.get(field) is not None:
+            normalized[field] = round(float(normalized[field]), 4)
+    return normalized
+
+
+def _get_all_ml_predictions(ticker: str) -> tuple[list[dict], list[dict]]:
+    """Generate current predictions from every trained model family."""
+    from ml.multi_horizon import HORIZONS, HorizonModel, MODEL_DIR
+
+    _settle_due_predictions()
+    jobs = []
+
+    default_path = MODEL_DIR / "stock_predictor.pkl"
+    if default_path.exists():
+        jobs.append(("stock_predictor", "default"))
+
+    for name, config in HORIZONS.items():
+        if (MODEL_DIR / f"{config.model_file}.pkl").exists():
+            jobs.append((name, "horizon"))
+
+    if (MODEL_DIR / "combined_model.pkl").exists():
+        jobs.append(("combined_model", "combined"))
+
+    predictions: list[dict] = []
+    errors: list[dict] = []
+
+    def predict(job: tuple[str, str]) -> dict:
+        name, family = job
+        if family == "default":
+            result = _get_ml_prediction(ticker)
+            if result.get("direction") == "N/A":
+                raise RuntimeError("Default model prediction unavailable")
+            return result
+        if family == "horizon":
+            model = HorizonModel(HORIZONS[name])
+            model.load()
+            return _normalize_model_prediction(model.predict_ticker(ticker))
+
+        from ml.sentiment.combined_model import CombinedPredictor
+
+        model = CombinedPredictor()
+        model.load()
+        return _normalize_model_prediction(model.predict(ticker))
+
+    worker_count = min(4, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_jobs = {executor.submit(predict, job): job for job in jobs}
+        for future in as_completed(future_jobs):
+            name, family = future_jobs[future]
+            try:
+                predictions.append(future.result())
+            except Exception as exc:
+                logger.warning("%s prediction failed for %s: %s", name, ticker, exc)
+                errors.append({"model_name": name, "family": family, "error": str(exc)})
+
+    predictions.sort(key=lambda item: (item.get("horizon", 0), item["model_name"]))
+    return predictions, errors
 
 
 def _auto_train_models():
@@ -361,9 +499,53 @@ async def api_strategies(
 
 @app.get("/api/stock/{ticker}/prediction")
 async def api_prediction(ticker: str):
-    """Get ML prediction for a stock."""
+    """Get the default ML prediction for a stock."""
     pred = _get_ml_prediction(ticker.upper())
     return {"ticker": ticker.upper(), "prediction": pred}
+
+
+@app.get("/api/stock/{ticker}/predictions")
+async def api_all_predictions(ticker: str):
+    """Get current predictions and realized history from every trained model."""
+    normalized_ticker = ticker.upper()
+    predictions, errors = _get_all_ml_predictions(normalized_ticker)
+    history = PredictionStore().get_history(ticker=normalized_ticker, limit=500)
+    return {
+        "ticker": normalized_ticker,
+        "predictions": predictions,
+        "history": history,
+        "errors": errors,
+    }
+
+
+@app.get("/api/predictions/history")
+async def api_prediction_history(
+    ticker: str | None = Query(None),
+    model: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Query the auditable prediction/outcome ledger."""
+    _settle_due_predictions()
+    return {
+        "predictions": PredictionStore().get_history(
+            ticker=ticker,
+            model_name=model,
+            limit=limit,
+        )
+    }
+
+
+@app.post("/api/predictions/settle")
+async def api_settle_predictions():
+    """Force a refresh of all due prediction outcomes."""
+    return _settle_due_predictions(force=True)
+
+
+@app.get("/api/models/status")
+async def api_model_status():
+    """Get last-trained times and live forward accuracy for every model."""
+    _settle_due_predictions()
+    return {"models": PredictionStore().model_statistics()}
 
 
 @app.get("/api/market/overview")
@@ -454,7 +636,10 @@ async def api_daily_predictions():
 @app.get("/api/training/status")
 async def api_training_status():
     """Get current training progress for all models."""
-    return {"models": training_tracker.get_all()}
+    return {
+        "models": training_tracker.get_all(),
+        "forward_models": PredictionStore().model_statistics(),
+    }
 
 
 @app.post("/api/training/start")
@@ -501,7 +686,7 @@ async def api_intraday(
             "interval": interval,
             "bars": [
                 {
-                    "time": t.strftime("%Y-%m-%d %H:%M"),
+                    "time": iso_utc(t),
                     "open": round(float(row["Open"]), 2),
                     "high": round(float(row["High"]), 2),
                     "low": round(float(row["Low"]), 2),
@@ -510,6 +695,14 @@ async def api_intraday(
                 }
                 for t, row in data.iterrows()
             ],
+            "predictions": [
+                prediction
+                for prediction in PredictionStore().get_history(
+                    ticker=ticker.upper(),
+                    limit=500,
+                )
+                if prediction["interval"].endswith(("m", "h"))
+            ][:100],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -519,45 +712,17 @@ async def api_intraday(
 async def api_daytrading_predict(ticker: str):
     """Get day trading prediction using the intraday HorizonModel."""
     try:
-        import numpy as np
         from ml.multi_horizon import HorizonModel, HORIZONS
-        from ml.features import compute_intraday_features
 
         config = HORIZONS["intraday"]
         model = HorizonModel(config)
         model.load()
-
-        data = yfinance.Ticker(ticker.upper()).history(
-            period=config.data_period, interval=config.data_interval,
+        prediction = _normalize_model_prediction(
+            model.predict_ticker(ticker.upper())
         )
-        if data.empty:
-            return {"error": f"No intraday data for {ticker}"}
-
-        features = compute_intraday_features(data)
-        if features.empty:
-            return {"error": "Insufficient intraday data for features"}
-
-        # Use last bar
-        available = [f for f in model.feature_names if f in features.columns]
-        missing = [f for f in model.feature_names if f not in features.columns]
-        if missing:
-            # Fill missing features with 0
-            for col in missing:
-                features[col] = 0.0
-
-        X = features.iloc[[-1]][model.feature_names]
-        X_scaled = model.scaler.transform(X)
-        direction, pred_return, confidence = model.predict(X_scaled)
-
-        return {
-            "ticker": ticker.upper(),
-            "direction": "UP" if pred_return >= 0 else "DOWN",
-            "predicted_return": round(pred_return * 100, 3),
-            "confidence": round(confidence * 100, 1),
-            "horizon_bars": config.horizon,
-            "interval": config.data_interval,
-            "model_status": "ready",
-        }
+        prediction["horizon_bars"] = config.horizon
+        prediction["model_status"] = "ready"
+        return prediction
     except FileNotFoundError:
         return {
             "ticker": ticker.upper(),
@@ -638,6 +803,11 @@ async def api_timeframes():
 @app.on_event("startup")
 async def on_startup():
     """Auto-start model training when the server boots."""
+    if os.environ.get("WEBAPP_AUTO_TRAIN", "1").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        logger.info("Server starting with web-app auto-training disabled")
+        return
     logger.info("Server starting — launching background model training...")
     thread = threading.Thread(target=_auto_train_models, daemon=True)
     thread.start()

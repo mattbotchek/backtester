@@ -16,7 +16,8 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 from sklearn.preprocessing import StandardScaler
 
 from .features import compute_features, create_target, create_regression_target
-from .model import StockPredictor, Prediction
+from .model import StockPredictor, Prediction, reconcile_prediction
+from .prediction_store import directional_hit
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,10 @@ class WalkForwardResult:
     accuracy: float = 0.0
     directional_accuracy: float = 0.0
     mean_absolute_error: float = 0.0
+    target_hit_accuracy: float = 0.0
+    confidence_floor: float = 0.0
+    coverage: float = 0.0
+    eligible_predictions: int = 0
     classification_report: str = ""
     confusion_matrix: list = field(default_factory=list)
 
@@ -40,6 +45,10 @@ class WalkForwardResult:
             f"  Total predictions:      {len(self.predictions)}\n"
             f"  Classification accuracy: {self.accuracy:.2%}\n"
             f"  Directional accuracy:    {self.directional_accuracy:.2%}\n"
+            f"  Target-price hit rate:   {self.target_hit_accuracy:.2%}\n"
+            f"  Confidence floor:        {self.confidence_floor:.0%}\n"
+            f"  Eligible predictions:    {self.eligible_predictions} "
+            f"({self.coverage:.2%} coverage)\n"
             f"  Mean absolute error:     {self.mean_absolute_error:.4f}\n"
             f"\n{self.classification_report}\n"
             f"{'=' * 60}\n"
@@ -55,6 +64,7 @@ def walk_forward_backtest(
     threshold: float = 0.0,
     n_splits: int = 5,
     min_train_size: int = 500,
+    confidence_floor: float = 0.0,
 ) -> WalkForwardResult:
     """Run a walk-forward (expanding window) backtest across ALL tickers.
 
@@ -65,7 +75,9 @@ def walk_forward_backtest(
     if test_tickers is None:
         test_tickers = tickers
 
-    result = WalkForwardResult()
+    if not 0 <= confidence_floor <= 1:
+        raise ValueError("confidence_floor must be between 0 and 1")
+    result = WalkForwardResult(confidence_floor=confidence_floor)
 
     # Step 1: Download and prepare all data upfront
     logger.info("Downloading data for %d tickers...", len(tickers))
@@ -78,7 +90,7 @@ def walk_forward_backtest(
                 logger.warning("Insufficient data for %s, skipping.", ticker)
                 continue
 
-            features = compute_features(data)
+            features = compute_features(data, ticker=ticker)
             cls_target = create_target(data, horizon=horizon, threshold=threshold)
             reg_target = create_regression_target(data, horizon=horizon)
 
@@ -125,6 +137,8 @@ def walk_forward_backtest(
     all_pred = []
     all_true_returns = []
     all_pred_returns = []
+    all_target_hits = []
+    total_candidates = 0
 
     for i in range(n_splits):
         train_end_idx = min_train_size + i * split_size
@@ -134,6 +148,7 @@ def walk_forward_backtest(
 
         split_date = all_dates[train_end_idx]
         test_end_date = all_dates[test_end_idx - 1]
+        purge_date = all_dates[max(0, train_end_idx - horizon)]
         logger.info(
             "Split %d/%d: train up to %s, test to %s",
             i + 1, n_splits, split_date, test_end_date
@@ -145,7 +160,8 @@ def walk_forward_backtest(
             if ticker not in ticker_data:
                 continue
             feat, cls_t, reg_t = ticker_data[ticker]
-            train_mask = feat.index < split_date
+            # Exclude samples whose forward targets can overlap the test fold.
+            train_mask = feat.index < purge_date
             if train_mask.sum() > 50:
                 train_X_parts.append(feat[train_mask])
                 train_y_cls_parts.append(cls_t[train_mask])
@@ -187,12 +203,45 @@ def walk_forward_backtest(
 
             X_test_scaled = predictor.scaler.transform(X_test)
             cls_preds = predictor.classifier.predict(X_test_scaled)
-            reg_preds = predictor.regressor.predict(X_test_scaled)
+            raw_reg_preds = predictor.regressor.predict(X_test_scaled)
+            probabilities = predictor.classifier.predict_proba(X_test_scaled)
+            confidence = probabilities.max(axis=1)
+            selected = confidence >= confidence_floor
+            total_candidates += len(X_test)
+            if not selected.any():
+                continue
+
+            positions = np.flatnonzero(selected)
+            cls_preds = cls_preds[selected]
+            raw_reg_preds = raw_reg_preds[selected]
+            X_test = X_test.iloc[positions]
+            y_cls_test = y_cls_test.iloc[positions]
+            y_reg_test = y_reg_test.iloc[positions]
+            confidence = confidence[selected]
+            reconciled = [
+                reconcile_prediction(int(label), float(predicted_return))
+                for label, predicted_return in zip(cls_preds, raw_reg_preds)
+            ]
+            directions = [item[0] for item in reconciled]
+            reg_preds = np.array([item[1] for item in reconciled])
+            target_hits = [
+                directional_hit(
+                    direction,
+                    1 + float(predicted_return),
+                    1 + float(actual_return),
+                )
+                for direction, predicted_return, actual_return in zip(
+                    directions,
+                    reg_preds,
+                    y_reg_test,
+                )
+            ]
 
             all_true.extend(y_cls_test.values)
             all_pred.extend(cls_preds)
             all_true_returns.extend(y_reg_test.values)
             all_pred_returns.extend(reg_preds)
+            all_target_hits.extend(target_hits)
 
             for j in range(len(X_test)):
                 result.predictions.append({
@@ -202,6 +251,9 @@ def walk_forward_backtest(
                     "pred_direction": int(cls_preds[j]),
                     "true_return": float(y_reg_test.iloc[j]),
                     "pred_return": float(reg_preds[j]),
+                    "direction": directions[j],
+                    "confidence": float(confidence[j]),
+                    "target_hit": bool(target_hits[j]),
                 })
 
     # Step 4: Compute aggregate metrics
@@ -220,6 +272,11 @@ def walk_forward_backtest(
         result.mean_absolute_error = float(np.mean(np.abs(
             np.array(all_true_returns) - np.array(all_pred_returns)
         )))
+        result.target_hit_accuracy = float(np.mean(all_target_hits))
+        result.eligible_predictions = len(all_true)
+        result.coverage = (
+            len(all_true) / total_candidates if total_candidates else 0.0
+        )
 
         label_map = {-1: "DOWN", 0: "FLAT", 1: "UP"}
         labels = sorted(set(all_true) | set(all_pred))

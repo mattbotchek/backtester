@@ -3,5 +3,7 @@
 results/
 ml/models/*.pkl
 ml/models/*.db
+ml/models/*.db-*
+ml/models/continuous_training_state.json
 _quick_check.py
 ml/__pycache__/

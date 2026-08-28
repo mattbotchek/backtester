@@ -3,9 +3,9 @@
 
 This script starts:
   1. Web server (FastAPI on port 8000)
-  2. ML headless prediction daemon
-  3. Sentiment data scraper (periodic)
-  4. Model retraining scheduler
+  2. Point-in-time public-data collection
+  3. Prediction generation and outcome settlement
+  4. Continuous all-model retraining and live-forward evaluation
 
 Usage:
   python run_server.py                    # Start everything
@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -45,6 +46,9 @@ signal.signal(signal.SIGTERM, signal_handler)
 def run_web_server(port: int):
     """Run the FastAPI web server."""
     import uvicorn
+
+    # The coordinated pipeline owns retraining when run_server.py is used.
+    os.environ["WEBAPP_AUTO_TRAIN"] = "0"
     logger.info("Starting web server on port %d...", port)
     uvicorn.run(
         "webapp.app:app",
@@ -88,10 +92,10 @@ def run_prediction_daemon(interval_minutes: int = 60):
             up_count, down_count = 0, 0
             for ticker in POPULAR_TICKERS[:20]:
                 try:
-                    pred = predictor.predict_ticker(ticker)
-                    if pred.direction == 1:
+                    pred = predictor.predict(ticker)
+                    if pred.direction == "UP":
                         up_count += 1
-                    elif pred.direction == -1:
+                    elif pred.direction == "DOWN":
                         down_count += 1
                 except Exception:
                     pass
@@ -141,6 +145,32 @@ def run_retrainer(interval_hours: int = 24):
         shutdown_event.wait(interval_hours * 3600)
 
 
+def run_continuous_pipeline(args):
+    """Run collection, predictions, forward scoring, and retraining together."""
+    from main import ML_TRAINING_TICKERS
+    from ml.continuous_training import run_continuous_training
+
+    enabled_intervals = []
+    if not args.no_scraper:
+        enabled_intervals.append(args.scrape_interval)
+    if not args.no_predictions:
+        enabled_intervals.append(args.predict_interval)
+    cycle_minutes = min(enabled_intervals, default=60)
+
+    run_continuous_training(
+        ML_TRAINING_TICKERS,
+        prediction_interval_minutes=cycle_minutes,
+        retrain_interval_hours=args.retrain_hours,
+        target_accuracy=args.target_accuracy,
+        minimum_accuracy=args.minimum_accuracy,
+        minimum_settled_predictions=args.minimum_outcomes,
+        enable_collection=not args.no_scraper,
+        enable_predictions=not args.no_predictions,
+        enable_retraining=not args.no_retrain,
+        stop_event=shutdown_event,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Stock Predictor 24/7 Server")
     parser.add_argument("--port", type=int, default=8000, help="Web server port")
@@ -150,6 +180,9 @@ def main():
     parser.add_argument("--scrape-interval", type=int, default=30, help="Scrape interval (minutes)")
     parser.add_argument("--predict-interval", type=int, default=60, help="Prediction interval (minutes)")
     parser.add_argument("--retrain-hours", type=int, default=24, help="Retrain interval (hours)")
+    parser.add_argument("--target-accuracy", type=float, default=0.70, help="Required live forward accuracy")
+    parser.add_argument("--minimum-accuracy", type=float, default=0.65, help="Minimum acceptable live forward accuracy")
+    parser.add_argument("--minimum-outcomes", type=int, default=30, help="Settled predictions required before accepting accuracy")
     args = parser.parse_args()
 
     logger.info("=" * 50)
@@ -162,19 +195,9 @@ def main():
 
     threads = []
 
-    # Start background services
-    if not args.no_scraper:
-        t = threading.Thread(target=run_sentiment_scraper, args=(args.scrape_interval,), daemon=True)
-        t.start()
-        threads.append(t)
-
-    if not args.no_predictions:
-        t = threading.Thread(target=run_prediction_daemon, args=(args.predict_interval,), daemon=True)
-        t.start()
-        threads.append(t)
-
-    if not args.no_retrain:
-        t = threading.Thread(target=run_retrainer, args=(args.retrain_hours,), daemon=True)
+    # One pipeline coordinates collection, prediction, settlement, and training.
+    if not (args.no_scraper and args.no_predictions and args.no_retrain):
+        t = threading.Thread(target=run_continuous_pipeline, args=(args,), daemon=True)
         t.start()
         threads.append(t)
 

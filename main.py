@@ -319,6 +319,7 @@ Examples:
             "interactive", "backtest", "compare", "headless",
             "ml-train", "ml-predict", "ml-backtest", "ml-headless",
             "ml-horizons-train", "ml-horizons-backtest",
+            "ml-continuous",
             "list",
         ],
         default="interactive",
@@ -333,9 +334,13 @@ Examples:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--output", "-o", default=None, help="Output CSV file")
     parser.add_argument("--model", default="stock_predictor", help="ML model name")
+    parser.add_argument("--target-accuracy", type=float, default=0.70, help="Required live forward accuracy")
+    parser.add_argument("--minimum-accuracy", type=float, default=0.65, help="Minimum acceptable live forward accuracy")
+    parser.add_argument("--minimum-outcomes", type=int, default=30, help="Settled predictions required to accept live accuracy")
+    parser.add_argument("--retrain-hours", type=int, default=24, help="Hours between continuous retraining rounds")
     parser.add_argument(
         "--horizon", nargs="+", default=None,
-        help="Horizon names for multi-horizon mode (intraday, short_1d, short_5d, medium_20d, long_60d, long_252d)",
+        help="Horizon names (realtime_5m, intraday, short_1d, short_5d, medium_20d, long_60d, long_252d)",
     )
     return parser
 
@@ -448,13 +453,34 @@ def main():
                     print(f"  {name}: CV {stats['cv_accuracy_mean']:.3f} +/- {stats['cv_accuracy_std']:.3f}  ({stats['n_samples']} samples)")
 
         case "ml-horizons-backtest":
-            from ml.multi_horizon import walk_forward_horizon, HORIZONS
+            from ml.multi_horizon import (
+                HORIZONS,
+                chronological_holdout_horizon,
+                walk_forward_horizon,
+            )
             horizons = args.horizon or list(HORIZONS.keys())
             for name in horizons:
-                if name == "intraday":
-                    print(f"  {name}: skipped (intraday walk-forward not supported)")
-                    continue
                 print(f"--- {name} ---")
+                if name == "realtime_5m":
+                    result = chronological_holdout_horizon(
+                        name,
+                        ML_TRAINING_TICKERS,
+                    )
+                    if "error" in result:
+                        print(f"  ERROR: {result['error']}")
+                    else:
+                        print(
+                            "  Lifecycle hit accuracy: "
+                            f"{result['lifecycle_hit_accuracy']:.3f}"
+                        )
+                        print(
+                            "  Direction mix: "
+                            f"UP {result['up_rate']:.1%}, "
+                            f"DOWN {result['down_rate']:.1%}, "
+                            f"FLAT {result['flat_rate']:.1%}"
+                        )
+                        print(f"  Predictions: {result['total_predictions']}")
+                    continue
                 result = walk_forward_horizon(name, ML_TRAINING_TICKERS)
                 if "error" in result:
                     print(f"  ERROR: {result['error']}")
@@ -463,6 +489,18 @@ def main():
                     print(f"  Directional Accuracy: {result['directional_accuracy']:.3f}")
                     print(f"  Predictions: {result['total_predictions']}")
                     print(result['classification_report'])
+
+        case "ml-continuous":
+            from ml.continuous_training import run_continuous_training
+
+            run_continuous_training(
+                ML_TRAINING_TICKERS,
+                prediction_interval_minutes=max(1, args.interval // 60),
+                retrain_interval_hours=args.retrain_hours,
+                target_accuracy=args.target_accuracy,
+                minimum_accuracy=args.minimum_accuracy,
+                minimum_settled_predictions=args.minimum_outcomes,
+            )
 
 
 if __name__ == "__main__":
